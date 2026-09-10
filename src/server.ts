@@ -11,6 +11,7 @@ import {
 } from "@aws-sdk/client-bedrock-runtime";
 import { estimateCost, loadConfig, modelTable, resolveModel, type Config, type Rung, type Usage } from "./config.js";
 import { ClientError, converseEventToOpenai, converseToOpenai, newStreamState, openaiToConverse, toError } from "./translate.js";
+import { Router, ToolJsonCheck, type Class, type Decision } from "./router.js";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Json = any;
@@ -18,7 +19,7 @@ type Json = any;
 const region = process.env.AWS_REGION ?? "us-east-1";
 const LOG_PATH = process.env.BEDROUTER_LOG ?? "./bedrouter.log.jsonl";
 
-// Decision-log line. The router milestone adds class/escalation fields; keep this open (extra keys are fine).
+// Decision-log line. Existing fields never change; the routing fields were appended by the router milestone.
 export type LogEntry = {
   ts: string;
   endpoint: string;
@@ -34,7 +35,18 @@ export type LogEntry = {
   costUsd: number | null;
   stopReason: string | null;
   error: string | null;
+  class: Class | null;
+  classReason: string | null;
+  conversationKey: string | null;
+  requestedModel: string | null;
+  routedModel: string | null;
+  sticky: boolean;
+  escalated: boolean;
+  escalationReason: string | null;
 };
+
+// Per-request routing state shared between the handler and the finally block.
+type RouteCtx = { decision?: Decision; tools: ToolJsonCheck };
 
 function appendLog(entry: LogEntry) {
   fs.appendFile(LOG_PATH, JSON.stringify(entry) + "\n", (err) => err && console.error("bedrouter: log write failed:", err.message));
@@ -91,9 +103,9 @@ function checkAuth(req: http.IncomingMessage) {
   if (got !== want) throw new HttpError(401, "invalid api key");
 }
 
-export function createServer(cfg: Config = loadConfig()): http.Server {
+export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRuntimeClient, "send"> = new BedrockRuntimeClient({ region })): http.Server {
   const table = modelTable(cfg);
-  const client = new BedrockRuntimeClient({ region });
+  const router = new Router(cfg);
   const aliases = () => [...table.keys()];
 
   const resolve = (name: unknown): Rung => {
@@ -102,10 +114,22 @@ export function createServer(cfg: Config = loadConfig()): http.Server {
     return rung;
   };
 
+  /** Resolve the client's model, then let the router pick the rung within that family. */
+  const route = (req: http.IncomingMessage, body: Json, log: LogEntry, rt: RouteCtx): Rung => {
+    const requested = resolve(body.model);
+    const header = req.headers["x-bedrouter-class"];
+    if (header !== undefined && !/^(execute|explore|off)$/.test(String(header))) throw new HttpError(400, `x-bedrouter-class must be execute, explore or off`);
+    const d = (rt.decision = router.route(body, requested, header as string | undefined));
+    Object.assign(log, {
+      clientModel: body.model, bedrockId: d.rung.bedrockId, family: d.rung.family, stream: !!body.stream,
+      class: d.class, classReason: d.classReason, conversationKey: d.conversationKey, requestedModel: requested.alias, routedModel: d.rung.alias, sticky: d.sticky,
+    });
+    return d.rung;
+  };
+
   // --- POST /v1/messages: Anthropic Messages shape, native passthrough via InvokeModel -------------
-  async function handleMessages(req: http.IncomingMessage, res: http.ServerResponse, body: Json, log: LogEntry, ac: AbortController) {
-    const rung = resolve(body.model);
-    Object.assign(log, { clientModel: body.model, bedrockId: rung.bedrockId, family: rung.family, stream: !!body.stream });
+  async function handleMessages(req: http.IncomingMessage, res: http.ServerResponse, body: Json, log: LogEntry, ac: AbortController, rt: RouteCtx) {
+    const rung = route(req, body, log, rt);
     if (rung.family !== "anthropic") {
       // ponytail: Anthropic-shape -> non-Anthropic model needs an Anthropic->Converse translator; add one when a
       // Claude Code user actually wants gpt-oss. Until then this is a clear 400, never a silent re-route.
@@ -146,6 +170,7 @@ export function createServer(cfg: Config = loadConfig()): http.Server {
       delete event["amazon-bedrock-invocationMetrics"];
       if (event.type === "message_start") takeUsage(event.message?.usage);
       if (event.type === "message_delta") { takeUsage(event.usage); log.stopReason = event.delta?.stop_reason ?? log.stopReason; }
+      if (event.type === "content_block_delta" && event.delta?.type === "input_json_delta") rt.tools.add(event.index, event.delta.partial_json ?? "");
       res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
     }
     finishUsage(log, rung, usage);
@@ -153,9 +178,8 @@ export function createServer(cfg: Config = loadConfig()): http.Server {
   }
 
   // --- POST /v1/chat/completions: OpenAI shape, translated to Converse (any family) -----------------
-  async function handleChat(_req: http.IncomingMessage, res: http.ServerResponse, body: Json, log: LogEntry, ac: AbortController) {
-    const rung = resolve(body.model);
-    Object.assign(log, { clientModel: body.model, bedrockId: rung.bedrockId, family: rung.family, stream: !!body.stream });
+  async function handleChat(req: http.IncomingMessage, res: http.ServerResponse, body: Json, log: LogEntry, ac: AbortController, rt: RouteCtx) {
+    const rung = route(req, body, log, rt);
     const input = openaiToConverse(body, rung.bedrockId);
     const id = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     const usageOf = (u: Json): Usage => ({ input: u?.inputTokens ?? 0, output: u?.outputTokens ?? 0, cacheRead: u?.cacheReadInputTokens, cacheWrite: u?.cacheWriteInputTokens });
@@ -171,6 +195,7 @@ export function createServer(cfg: Config = loadConfig()): http.Server {
     startSse(res);
     const st = newStreamState(body.model, id);
     for await (const ev of out.stream ?? []) {
+      if (ev.contentBlockDelta?.delta?.toolUse) rt.tools.add(ev.contentBlockDelta.contentBlockIndex ?? 0, ev.contentBlockDelta.delta.toolUse.input ?? "");
       for (const chunk of converseEventToOpenai(st, ev)) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     }
     log.stopReason = st.stopReason ?? null;
@@ -202,14 +227,18 @@ export function createServer(cfg: Config = loadConfig()): http.Server {
     const log: LogEntry = {
       ts: new Date().toISOString(), endpoint: url.pathname, clientModel: null, bedrockId: null, family: null, stream: false,
       inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null, latencyMs: 0, costUsd: null, stopReason: null, error: null,
+      class: null, classReason: null, conversationKey: null, requestedModel: null, routedModel: null, sticky: false, escalated: false, escalationReason: null,
     };
     const ac = new AbortController();
     res.on("close", () => ac.abort());
+    const rt: RouteCtx = { tools: new ToolJsonCheck() };
+    let failed: Json = null;
     try {
       checkAuth(req);
       const body = await readJson(req);
-      await handler(req, res, body, log, ac);
+      await handler(req, res, body, log, ac, rt);
     } catch (err: Json) {
+      failed = err;
       log.error = err?.message ?? String(err);
       if (ac.signal.aborted && !res.writableEnded) { res.destroy(); }
       else if (res.headersSent) {
@@ -221,6 +250,12 @@ export function createServer(cfg: Config = loadConfig()): http.Server {
       }
     } finally {
       log.latencyMs = Date.now() - started;
+      if (rt.decision) {
+        const d = rt.decision;
+        const obs = router.observe(d, { stopReason: log.stopReason, outputTokens: log.outputTokens, errorStatus: failed ? errorStatus(failed) : null, aborted: ac.signal.aborted, malformedToolJson: rt.tools.malformed() });
+        log.escalated = d.escalated || obs.escalated;
+        log.escalationReason = [d.escalationReason, obs.reason].filter(Boolean).join("+") || null;
+      }
       appendLog(log);
     }
   });
