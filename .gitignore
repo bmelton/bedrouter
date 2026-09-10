@@ -1,0 +1,5 @@
+node_modules/
+dist/
+bedrouter.json
+bedrouter.log.jsonl
+.env
