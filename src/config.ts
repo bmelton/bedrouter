@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import type { RoutingConfig } from "./router.js";
 
 export type Family = "anthropic" | "openai";
 
@@ -13,6 +14,7 @@ export type Rung = {
 export type Config = {
   families: Record<Family, Omit<Rung, "family">[]>;
   aliases?: Record<string, string>;
+  routing?: Omit<Partial<RoutingConfig>, "shape" | "keywords"> & { shape?: Partial<RoutingConfig["shape"]>; keywords?: Partial<RoutingConfig["keywords"]> };
 };
 
 export const DEFAULT_CONFIG_PATH = "./bedrouter.json";

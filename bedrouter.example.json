@@ -19,5 +19,20 @@
     "claude-opus-5": "opus",
     "claude-fable-5-1": "fable",
     "gpt-oss": "gpt-oss-120b"
+  },
+  "routing": {
+    "enabled": true,
+    "honorClientModel": true,
+    "maxConversations": 1000,
+    "retryWindowMs": 60000,
+    "classes": {
+      "anthropic": { "execute": "sonnet",      "explore": "opus" },
+      "openai":    { "execute": "gpt-oss-20b", "explore": "gpt-oss-120b" }
+    },
+    "shape": { "exploreInputTokens": 60000, "exploreTools": 40, "executeTurns": 8, "executeLastUserChars": 200 },
+    "keywords": {
+      "explore": ["design", "architect", "architecture", "plan", "investigate", "why", "compare", "tradeoff", "trade-off", "refactor the whole", "explore", "research", "evaluate", "propose", "brainstorm"],
+      "execute": ["implement", "fix", "add test", "add a test", "rename", "update", "apply", "bump", "write", "change", "remove", "delete"]
+    }
   }
 }
