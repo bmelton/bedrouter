@@ -4,6 +4,31 @@ A thin local proxy that lets AI coding CLIs (Claude Code, Codex, Cursor, Cline, 
 
 This is the core proxy. Class-based routing (picking the cheapest model that can reliably complete the task) is the next milestone; see the note at the end.
 
+## How it works
+
+```mermaid
+flowchart LR
+    CC["Claude Code<br/>(Anthropic Messages shape)"] -->|"POST /v1/messages"| R
+    OA["Codex / Cursor / Cline / any OpenAI client<br/>(chat completions shape)"] -->|"POST /v1/chat/completions"| R
+
+    subgraph Bedrouter ["bedrouter (127.0.0.1:20129)"]
+        R["resolve model alias<br/>bedrouter.json"] -->|"unknown alias"| E404["404 + list of valid aliases"]
+        R -->|"anthropic family, Anthropic shape"| P["native passthrough<br/>body as-is + anthropic_version + anthropic_beta"]
+        R -->|"OpenAI shape, any family"| T["translate<br/>OpenAI &harr; Converse"]
+        P --> L
+        T --> L["decision log<br/>bedrouter.log.jsonl"]
+    end
+
+    P -->|"InvokeModel /<br/>InvokeModelWithResponseStream"| B
+    T -->|"Converse /<br/>ConverseStream"| B["AWS Bedrock<br/>us.anthropic.claude-* &nbsp;|&nbsp; openai.gpt-oss-*"]
+```
+
+1. A client sends its usual request to the local endpoint; only the base URL changes.
+2. Bedrouter looks the `model` name up in `bedrouter.json`. Every rung has a Bedrock model ID and a price; client aliases (what Claude Code sends by default) point at rungs. Unknown names get a 404 that lists the valid ones.
+3. The request goes to Bedrock on one of two paths. Anthropic-shape requests for Claude models are forwarded byte-for-byte through `InvokeModel`, so tool use, extended thinking, `cache_control` and beta headers all survive. OpenAI-shape requests are translated to the Converse API, which works for every family in the config, and the Converse response or event stream is translated back into chat-completion JSON or SSE chunks.
+4. Streaming is passed through as SSE either way. When the response ends, one JSON line with the resolved model, token counts, latency, estimated cost and stop reason is appended to the decision log.
+
+
 ## Install and run
 
 Requires Node 20+ and AWS credentials that can call Bedrock.
