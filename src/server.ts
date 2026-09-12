@@ -56,10 +56,30 @@ export type LogEntry = {
   classifierNote: string | null; // the classifier model's one-line reason, or its error; null when it did not run
   classifierMs: number | null;
   classifierCostUsd: number | null;
+  sessionKey: string | null; // client-supplied x-bedrouter-session (pi-bedrouter sends Pi's session id); null when absent
 };
 
 /** Running totals per conversation, served on GET /v1/conversations/:key for UI integrations (pi-bedrouter's footer). */
 export type ConversationStats = { key: string; requests: number; costUsd: number; requestedCostUsd: number; classifierCostUsd: number; inputTokens: number; outputTokens: number; escalations: number; class: Class | null; routedModel: string | null; requestedModel: string | null; lastTs: string };
+/**
+ * Running totals per client session, served on GET /v1/sessions/:key. A session is whatever the client says it is via the
+ * `x-bedrouter-session` request header (pi-bedrouter sends Pi's session id), so unlike a conversation it survives
+ * system-prompt changes, compaction and sub-agent calls, and it counts requests the router did not track (trivial /
+ * pinned rungs, errors). Seeded from the decision log on startup so a server restart does not zero the running session.
+ */
+export type SessionStats = {
+  key: string; requests: number; errors: number; conversations: number;
+  costUsd: number; requestedCostUsd: number; classifierCostUsd: number;
+  inputTokens: number; outputTokens: number; cacheReadTokens: number; escalations: number;
+  byRoute: Record<string, { requests: number; costUsd: number; requestedCostUsd: number; inputTokens: number; outputTokens: number }>;
+  firstTs: string; lastTs: string;
+};
+const SESSION_KEY_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+export const sessionKeyOf = (h: string | string[] | undefined): string | null => {
+  const v = Array.isArray(h) ? h[0] : h;
+  return v && SESSION_KEY_RE.test(v) ? v : null;
+};
+
 // Per-request routing state shared between the handler and the finally block.
 type RouteCtx = { decision?: Decision; requested?: Rung; tools: ToolJsonCheck };
 
@@ -147,6 +167,33 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     conversations.delete(log.conversationKey); conversations.set(log.conversationKey, c);
     if (conversations.size > MAX_CONV_STATS) conversations.delete(conversations.keys().next().value!);
   };
+  const sessions = new Map<string, SessionStats>();
+  const sessionConvs = new Map<string, Set<string>>();
+  const MAX_SESSION_STATS = 500;
+  const tallySession = (log: LogEntry) => {
+    if (!log.sessionKey) return;
+    let st = sessions.get(log.sessionKey);
+    if (!st) st = { key: log.sessionKey, requests: 0, errors: 0, conversations: 0, costUsd: 0, requestedCostUsd: 0, classifierCostUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, escalations: 0, byRoute: {}, firstTs: log.ts, lastTs: log.ts };
+    st.requests++; if (log.error) st.errors++;
+    st.costUsd += log.costUsd ?? 0; st.requestedCostUsd += log.requestedCostUsd ?? log.costUsd ?? 0; st.classifierCostUsd += log.classifierCostUsd ?? 0;
+    st.inputTokens += log.inputTokens ?? 0; st.outputTokens += log.outputTokens ?? 0; st.cacheReadTokens += log.cacheReadTokens ?? 0; st.escalations += log.escalated ? 1 : 0;
+    if (log.routedModel) {
+      const rk = `${log.requestedModel ?? "?"} -> ${log.routedModel}`;
+      const r = (st.byRoute[rk] ??= { requests: 0, costUsd: 0, requestedCostUsd: 0, inputTokens: 0, outputTokens: 0 });
+      r.requests++; r.costUsd += log.costUsd ?? 0; r.requestedCostUsd += log.requestedCostUsd ?? log.costUsd ?? 0; r.inputTokens += log.inputTokens ?? 0; r.outputTokens += log.outputTokens ?? 0;
+    }
+    if (log.conversationKey) { let cs = sessionConvs.get(log.sessionKey); if (!cs) sessionConvs.set(log.sessionKey, (cs = new Set())); cs.add(log.conversationKey); st.conversations = cs.size; }
+    st.lastTs = log.ts;
+    sessions.delete(log.sessionKey); sessions.set(log.sessionKey, st);
+    if (sessions.size > MAX_SESSION_STATS) { const k = sessions.keys().next().value!; sessions.delete(k); sessionConvs.delete(k); }
+  };
+  // Seed session totals from the log so a restarted server still answers for the session that is running now.
+  try {
+    if (fs.existsSync(LOG_PATH)) for (const line of fs.readFileSync(LOG_PATH, "utf8").split("\n")) {
+      if (!line.includes('"sessionKey":"')) continue;
+      try { tallySession(JSON.parse(line)); } catch { /* partial line */ }
+    }
+  } catch (err) { console.error("bedrouter: could not seed session totals from the log:", (err as Error).message); }
   const classifierRung = router.rc.classifier.enabled ? table.get(router.rc.classifier.model!) : undefined;
   if (router.rc.classifier.enabled && !classifierRung) throw new Error(`routing.classifier.model "${router.rc.classifier.model}" is not a known model`);
   const aliases = () => [...table.keys()];
@@ -291,6 +338,11 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       return c ? sendJson(res, 200, c) : sendJson(res, 404, { error: { message: "unknown conversation" } });
     }
     if (req.method === "GET" && url.pathname === "/v1/conversations") return sendJson(res, 200, { data: [...conversations.values()].slice(-50).reverse() });
+    if (req.method === "GET" && url.pathname.startsWith("/v1/sessions/")) {
+      const st = sessions.get(decodeURIComponent(url.pathname.slice("/v1/sessions/".length)));
+      return st ? sendJson(res, 200, st) : sendJson(res, 404, { error: { message: "unknown session" } });
+    }
+    if (req.method === "GET" && url.pathname === "/v1/sessions") return sendJson(res, 200, { data: [...sessions.values()].slice(-50).reverse() });
     const handler = req.method === "POST" ? { "/v1/messages": handleMessages, "/v1/chat/completions": handleChat }[url.pathname] : undefined;
     if (!handler) return sendJson(res, 404, errorBody(new HttpError(404, `no route for ${req.method} ${url.pathname}`), shape));
 
@@ -300,6 +352,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null, latencyMs: 0, costUsd: null, requestedCostUsd: null, stopReason: null, error: null,
       class: null, classReason: null, conversationKey: null, requestedModel: null, routedModel: null, sticky: false, escalated: false, escalationReason: null,
       classifierNote: null, classifierMs: null, classifierCostUsd: null,
+      sessionKey: sessionKeyOf(req.headers["x-bedrouter-session"]),
     };
     const ac = new AbortController();
     res.on("close", () => ac.abort());
@@ -335,6 +388,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       }
       appendLog(log);
       tally(log);
+      tallySession(log);
       if (DEBUG) {
         if (log.error) debug(`  ✗ ${log.latencyMs} ms  ${log.error}${log.escalationReason ? `  → escalation:${log.escalationReason}${log.escalated ? " (moved up)" : " (at ceiling)"}` : ""}`);
         else debug(`  ← ${log.stopReason ?? "?"}  in ${kTok(log.inputTokens ?? 0)}${log.cacheReadTokens ? ` (+${kTok(log.cacheReadTokens)} cached)` : ""}  out ${kTok(log.outputTokens ?? 0)}  ${log.latencyMs} ms  ${usd(log.costUsd)}${log.requestedCostUsd != null && log.requestedCostUsd !== log.costUsd ? ` (asked-for model: ${usd(log.requestedCostUsd)})` : ""}${log.escalationReason ? `  → escalation:${log.escalationReason}${log.escalated ? " (next request moves up)" : " (already at ceiling)"}` : ""}`);

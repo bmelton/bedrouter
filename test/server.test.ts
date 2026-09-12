@@ -196,3 +196,35 @@ test("decision headers on both paths, /health, /v1/models metadata and /v1/conve
     void post;
   });
 });
+
+test("x-bedrouter-session: per-session totals across conversations and untracked requests, served on /v1/sessions, seeded from the log on restart", async () => {
+  const client = fakeClient((c) => (c.name === "ConverseCommand" ? converseReply : anthropicReply()));
+  const sid = `pi-${Date.now()}`;
+  const mk = () => { const server = createServer(cfg, client); return new Promise<{ server: any; base: string }>((r) => server.listen(0, "127.0.0.1", () => r({ server, base: `http://127.0.0.1:${(server.address() as AddressInfo).port}` }))); };
+  const hdr = { "content-type": "application/json", "x-bedrouter-session": sid };
+  let { server, base } = await mk();
+  try {
+    // two different conversations (different first user message) plus one router-untracked request (router off via bypass header)
+    await fetch(base + "/v1/messages", { method: "POST", headers: hdr, body: JSON.stringify(req("design the schema")) });
+    await fetch(base + "/v1/messages", { method: "POST", headers: hdr, body: JSON.stringify(req("implement the thing")) });
+    await fetch(base + "/v1/messages", { method: "POST", headers: { ...hdr, "x-bedrouter-class": "off" }, body: JSON.stringify(req("whatever")) });
+    await fetch(base + "/v1/messages", { method: "POST", headers: { "content-type": "application/json", "x-bedrouter-session": "not valid!" }, body: JSON.stringify(req("no session")) });
+    await new Promise((r) => setTimeout(r, 30));
+    const st = await (await fetch(base + `/v1/sessions/${sid}`)).json();
+    assert.deepEqual([st.key, st.requests, st.errors, st.conversations, st.escalations], [sid, 3, 0, 2, 0]);
+    assert.ok(st.costUsd > 0 && st.requestedCostUsd > 0 && st.inputTokens === 30 && st.outputTokens === 15);
+    assert.deepEqual(Object.keys(st.byRoute).sort(), ["sonnet -> opus", "sonnet -> sonnet"]);
+    assert.equal(st.byRoute["sonnet -> sonnet"].requests, 2);
+    const list = await (await fetch(base + "/v1/sessions")).json();
+    assert.equal(list.data[0].key, sid);
+    assert.equal((await fetch(base + "/v1/sessions/nope")).status, 404);
+    const [bad] = await lastLog(1);
+    assert.equal(bad.sessionKey, null);
+  } finally { server.close(); }
+  // restart: totals come back from the decision log
+  ({ server, base } = await mk());
+  try {
+    const st = await (await fetch(base + `/v1/sessions/${sid}`)).json();
+    assert.deepEqual([st.requests, st.conversations], [3, 2]);
+  } finally { server.close(); }
+});

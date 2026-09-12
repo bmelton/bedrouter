@@ -2,7 +2,7 @@
 // `bedrouter` binary and `npm start`.
 //   bedrouter [serve] [--debug]     credential preflight, then serve (default)
 //   bedrouter doctor [--probe]      credential source, config, optional 1-token probe of every rung
-//   bedrouter report [--since t] [--log p] [--json]
+//   bedrouter report [--since t] [--session key] [--log p] [--json]
 //   bedrouter smoke                 one streaming request per endpoint against real Bedrock
 import "./env.js";
 

@@ -3,18 +3,19 @@ import fs from "node:fs";
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   // Savings report over the decision log: what routing cost versus what the same usage would have cost on the model each
-  // client asked for. Usage: npm run report [-- --log path] [--json] [--since 2026-09-14T00:00:00Z]
+  // client asked for. Usage: npm run report [-- --log path] [--json] [--since 2026-09-14T00:00:00Z] [--session key]
 
-  type Line = { ts: string; classifierCostUsd?: number | null; classifierMs?: number | null; class: string | null; classReason: string | null; requestedModel: string | null; routedModel: string | null; costUsd: number | null; requestedCostUsd: number | null; inputTokens: number | null; outputTokens: number | null; cacheReadTokens: number | null; latencyMs: number; error: string | null; escalated: boolean; escalationReason: string | null; conversationKey: string | null; endpoint: string };
+  type Line = { ts: string; classifierCostUsd?: number | null; classifierMs?: number | null; class: string | null; classReason: string | null; requestedModel: string | null; routedModel: string | null; costUsd: number | null; requestedCostUsd: number | null; inputTokens: number | null; outputTokens: number | null; cacheReadTokens: number | null; latencyMs: number; error: string | null; escalated: boolean; escalationReason: string | null; conversationKey: string | null; sessionKey?: string | null; endpoint: string };
 
   const args = argv;
   const opt = (name: string) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : undefined; };
   const logPath = opt("log") ?? process.env.BEDROUTER_LOG ?? "./bedrouter.log.jsonl";
   const since = opt("since") ? Date.parse(opt("since")!) : 0;
   const asJson = args.includes("--json");
+  const session = opt("session");
 
   if (!fs.existsSync(logPath)) { console.error(`no log at ${logPath}`); return 1; }
-  const lines: Line[] = fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((l: Line) => Date.parse(l.ts) >= since);
+  const lines: Line[] = fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((l: Line) => Date.parse(l.ts) >= since && (!session || l.sessionKey === session));
   const priced = lines.filter((l) => l.costUsd != null);
 
   type Agg = { requests: number; costUsd: number; requestedCostUsd: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; escalations: number; latencyMs: number };
@@ -42,7 +43,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
   if (asJson) {
     const obj = (m: Map<string, Agg>) => Object.fromEntries(m);
-    console.log(JSON.stringify({ log: logPath, requests: lines.length, priced: priced.length, errors, conversations, total, classifier: { calls: classifierCalls.length, costUsd: classifierUsd, avgMs: classifierCalls.length ? classifierMs / classifierCalls.length : 0 }, savedUsd: saved, savedPct: pct, byClass: obj(byClass), byRoute: obj(byRoute), byReason: obj(byReason), escalations: Object.fromEntries(escalations) }, null, 2));
+    console.log(JSON.stringify({ log: logPath, session: session ?? null, requests: lines.length, priced: priced.length, errors, conversations, total, classifier: { calls: classifierCalls.length, costUsd: classifierUsd, avgMs: classifierCalls.length ? classifierMs / classifierCalls.length : 0 }, savedUsd: saved, savedPct: pct, byClass: obj(byClass), byRoute: obj(byRoute), byReason: obj(byReason), escalations: Object.fromEntries(escalations) }, null, 2));
     return 0;
   }
 
@@ -56,7 +57,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       console.log(`  ${pad(k, 30)} ${num(a.requests, 6)} ${num(a.inputTokens, 9)} ${num(a.outputTokens, 8)} ${usd(a.costUsd).padStart(10)} ${usd(a.requestedCostUsd).padStart(13)} ${usd(a.requestedCostUsd - a.costUsd).padStart(10)} ${num(a.escalations, 4)}`);
   };
 
-  console.log(`bedrouter report  ${logPath}${since ? `  since ${new Date(since).toISOString()}` : ""}`);
+  console.log(`bedrouter report  ${logPath}${since ? `  since ${new Date(since).toISOString()}` : ""}${session ? `  session ${session}` : ""}`);
   console.log(`  requests ${lines.length} (${priced.length} reached a model, ${errors} errors), conversations ${conversations}`);
   console.log(`  tokens   in ${total.inputTokens}  out ${total.outputTokens}  cache-read ${total.cacheReadTokens}`);
   console.log(`  cost     ${usd(total.costUsd)} actual vs ${usd(total.requestedCostUsd)} if every request had run on the model the client asked for`);
