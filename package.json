@@ -4,16 +4,20 @@
   "description": "Local OpenAI/Anthropic-compatible proxy in front of AWS Bedrock",
   "type": "module",
   "private": true,
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "start": "tsx src/server.ts",
-    "start:debug": "tsx src/server.ts --debug",
-    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/cli.ts",
+    "start:debug": "tsx src/cli.ts --debug",
+    "dev": "tsx watch src/cli.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
-    "smoke": "tsx scripts/smoke.ts",
-    "doctor": "tsx scripts/doctor.ts",
-    "report": "tsx scripts/report.ts"
+    "smoke": "tsx src/cli.ts smoke",
+    "doctor": "tsx src/cli.ts doctor",
+    "report": "tsx src/cli.ts report",
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.900.0"
@@ -22,5 +26,19 @@
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
+  },
+  "bin": {
+    "bedrouter": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "bedrouter.example.json",
+    ".env.example",
+    "README.md"
+  ],
+  "exports": {
+    "./package.json": "./package.json",
+    "./bedrouter.example.json": "./bedrouter.example.json",
+    "./.env.example": "./.env.example"
   }
 }

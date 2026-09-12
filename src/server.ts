@@ -2,7 +2,6 @@ import "./env.js"; // must run before anything reads process.env
 import http from "node:http";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { pathToFileURL } from "node:url";
 import {
   BedrockRuntimeClient,
   ConverseCommand,
@@ -19,10 +18,11 @@ import { classifyWithModel } from "./classifier.js";
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Json = any;
 
-const region = process.env.AWS_REGION ?? "us-east-1";
+const VERSION: string = (() => { try { return JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version; } catch { return "0.0.0"; } })();
+export const region = process.env.AWS_REGION ?? "us-east-1";
 const LOG_PATH = process.env.BEDROUTER_LOG ?? "./bedrouter.log.jsonl";
 // Debug mode: a human-readable line on stdout when a request arrives, when it is routed, and when it finishes.
-const DEBUG = /^(1|true|yes|on)$/i.test(process.env.BEDROUTER_DEBUG ?? "") || process.argv.includes("--debug");
+export const DEBUG = /^(1|true|yes|on)$/i.test(process.env.BEDROUTER_DEBUG ?? "") || process.argv.includes("--debug");
 const debug = (line: string) => { if (DEBUG) console.log(line); };
 const hhmmss = () => new Date().toISOString().slice(11, 19);
 const kTok = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
@@ -58,6 +58,8 @@ export type LogEntry = {
   classifierCostUsd: number | null;
 };
 
+/** Running totals per conversation, served on GET /v1/conversations/:key for UI integrations (pi-bedrouter's footer). */
+export type ConversationStats = { key: string; requests: number; costUsd: number; requestedCostUsd: number; classifierCostUsd: number; inputTokens: number; outputTokens: number; escalations: number; class: Class | null; routedModel: string | null; requestedModel: string | null; lastTs: string };
 // Per-request routing state shared between the handler and the finally block.
 type RouteCtx = { decision?: Decision; requested?: Rung; tools: ToolJsonCheck };
 
@@ -99,13 +101,26 @@ function readJson(req: http.IncomingMessage): Promise<Json> {
   });
 }
 
+/** The routing decision, echoed as response headers so clients (Pi's after_provider_response) can show it live. */
+function decisionHeaders(log: LogEntry): Record<string, string> {
+  const h: Record<string, string> = {};
+  if (log.routedModel) h["x-bedrouter-model"] = log.routedModel;
+  if (log.requestedModel) h["x-bedrouter-requested"] = log.requestedModel;
+  if (log.bedrockId) h["x-bedrouter-bedrock-id"] = log.bedrockId;
+  if (log.class) h["x-bedrouter-class"] = log.class;
+  if (log.classReason) h["x-bedrouter-reason"] = log.classReason;
+  if (log.conversationKey) h["x-bedrouter-conversation"] = log.conversationKey;
+  if (log.classifierNote != null) h["x-bedrouter-classifier"] = log.classifierNote.replace(/[^\x20-\x7e]/g, "?").slice(0, 200);
+  return h;
+}
+
 function sendJson(res: http.ServerResponse, status: number, body: Json) {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
 }
 
-function startSse(res: http.ServerResponse) {
-  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+function startSse(res: http.ServerResponse, extra: Record<string, string> = {}) {
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive", ...extra });
   res.flushHeaders();
 }
 
@@ -120,6 +135,18 @@ function checkAuth(req: http.IncomingMessage) {
 export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRuntimeClient, "send"> = new BedrockRuntimeClient({ region })): http.Server {
   const table = modelTable(cfg);
   const router = new Router(cfg);
+  const conversations = new Map<string, ConversationStats>();
+  const MAX_CONV_STATS = 2000;
+  const tally = (log: LogEntry) => {
+    if (!log.conversationKey) return;
+    let c = conversations.get(log.conversationKey);
+    if (!c) { c = { key: log.conversationKey, requests: 0, costUsd: 0, requestedCostUsd: 0, classifierCostUsd: 0, inputTokens: 0, outputTokens: 0, escalations: 0, class: null, routedModel: null, requestedModel: null, lastTs: log.ts }; }
+    c.requests++; c.costUsd += log.costUsd ?? 0; c.requestedCostUsd += log.requestedCostUsd ?? log.costUsd ?? 0; c.classifierCostUsd += log.classifierCostUsd ?? 0;
+    c.inputTokens += log.inputTokens ?? 0; c.outputTokens += log.outputTokens ?? 0; c.escalations += log.escalated ? 1 : 0;
+    c.class = log.class; c.routedModel = log.routedModel; c.requestedModel = log.requestedModel; c.lastTs = log.ts;
+    conversations.delete(log.conversationKey); conversations.set(log.conversationKey, c);
+    if (conversations.size > MAX_CONV_STATS) conversations.delete(conversations.keys().next().value!);
+  };
   const classifierRung = router.rc.classifier.enabled ? table.get(router.rc.classifier.model!) : undefined;
   if (router.rc.classifier.enabled && !classifierRung) throw new Error(`routing.classifier.model "${router.rc.classifier.model}" is not a known model`);
   const aliases = () => [...table.keys()];
@@ -187,11 +214,12 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       takeUsage(msg.usage);
       log.stopReason = msg.stop_reason ?? null;
       finishUsage(log, rung, usage, rt);
+      for (const [k, v] of Object.entries(decisionHeaders(log))) res.setHeader(k, v);
       return sendJson(res, 200, msg);
     }
 
     const out = await client.send(new InvokeModelWithResponseStreamCommand(cmd), { abortSignal: ac.signal });
-    startSse(res);
+    startSse(res, decisionHeaders(log));
     for await (const ev of out.body ?? []) {
       if (!ev.chunk?.bytes) {
         const err = ev.internalServerException ?? ev.modelStreamErrorException ?? ev.validationException ?? ev.throttlingException ?? ev.modelTimeoutException ?? ev.serviceUnavailableException;
@@ -220,11 +248,12 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       const out = await client.send(new ConverseCommand(input), { abortSignal: ac.signal });
       log.stopReason = out.stopReason ?? null;
       finishUsage(log, rung, usageOf(out.usage), rt);
+      for (const [k, v] of Object.entries(decisionHeaders(log))) res.setHeader(k, v);
       return sendJson(res, 200, converseToOpenai(out, body.model, id));
     }
 
     const out = await client.send(new ConverseStreamCommand(input), { abortSignal: ac.signal });
-    startSse(res);
+    startSse(res, decisionHeaders(log));
     const st = newStreamState(body.model, id);
     for await (const ev of out.stream ?? []) {
       if (ev.contentBlockDelta?.delta?.toolUse) rt.tools.add(ev.contentBlockDelta.contentBlockIndex ?? 0, ev.contentBlockDelta.delta.toolUse.input ?? "");
@@ -250,11 +279,17 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     const shape = url.pathname === "/v1/messages" ? "anthropic" : "openai";
-    if (req.method === "GET" && url.pathname === "/health") return sendJson(res, 200, { ok: true, region });
+    if (req.method === "GET" && url.pathname === "/health") return sendJson(res, 200, { ok: true, region, pid: process.pid, version: VERSION, routing: router.rc.enabled, classifier: router.rc.classifier.enabled ? router.rc.classifier.model : null, uptimeS: Math.round(process.uptime()) });
     if (req.method === "GET" && url.pathname === "/v1/models") {
-      const data = [...table.entries()].map(([id, r]) => ({ id, object: "model", created: 0, owned_by: r.family, bedrock_id: r.bedrockId }));
+      const data = [...table.entries()].map(([id, r]) => ({ id, object: "model", created: 0, owned_by: r.family, bedrock_id: r.bedrockId,
+        bedrouter: { family: r.family, rung: r.alias, auto: !!r.auto, inputPerM: r.inputPerM, outputPerM: r.outputPerM } }));
       return sendJson(res, 200, { object: "list", data });
     }
+    if (req.method === "GET" && url.pathname.startsWith("/v1/conversations/")) {
+      const c = conversations.get(url.pathname.slice("/v1/conversations/".length));
+      return c ? sendJson(res, 200, c) : sendJson(res, 404, { error: { message: "unknown conversation" } });
+    }
+    if (req.method === "GET" && url.pathname === "/v1/conversations") return sendJson(res, 200, { data: [...conversations.values()].slice(-50).reverse() });
     const handler = req.method === "POST" ? { "/v1/messages": handleMessages, "/v1/chat/completions": handleChat }[url.pathname] : undefined;
     if (!handler) return sendJson(res, 404, errorBody(new HttpError(404, `no route for ${req.method} ${url.pathname}`), shape));
 
@@ -298,19 +333,11 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
         log.escalationReason = [d.escalationReason, obs.reason].filter(Boolean).join("+") || null;
       }
       appendLog(log);
+      tally(log);
       if (DEBUG) {
         if (log.error) debug(`  ✗ ${log.latencyMs} ms  ${log.error}${log.escalationReason ? `  → escalation:${log.escalationReason}${log.escalated ? " (moved up)" : " (at ceiling)"}` : ""}`);
         else debug(`  ← ${log.stopReason ?? "?"}  in ${kTok(log.inputTokens ?? 0)}${log.cacheReadTokens ? ` (+${kTok(log.cacheReadTokens)} cached)` : ""}  out ${kTok(log.outputTokens ?? 0)}  ${log.latencyMs} ms  ${usd(log.costUsd)}${log.requestedCostUsd != null && log.requestedCostUsd !== log.costUsd ? ` (asked-for model: ${usd(log.requestedCostUsd)})` : ""}${log.escalationReason ? `  → escalation:${log.escalationReason}${log.escalated ? " (next request moves up)" : " (already at ceiling)"}` : ""}`);
       }
     }
   });
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const port = Number(process.env.PORT ?? 20129);
-  const client = new BedrockRuntimeClient({ region });
-  const p = await preflight(client);
-  console.log(describe(p, region));
-  if (!p.ok && !process.env.BEDROUTER_SKIP_PREFLIGHT) process.exit(1);
-  createServer(loadConfig(), client).listen(port, "127.0.0.1", () => console.log(`bedrouter listening on http://127.0.0.1:${port}${DEBUG ? "  (debug: printing every request)" : "  (BEDROUTER_DEBUG=1 or --debug to print requests)"}`));
 }

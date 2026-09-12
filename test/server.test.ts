@@ -163,3 +163,36 @@ test("classifier failure leaves the rules' decision in place", async () => {
     assert.match(log.classifierNote, /ThrottlingException/);
   });
 });
+
+test("decision headers on both paths, /health, /v1/models metadata and /v1/conversations tallies", async () => {
+  const client = fakeClient((c) => (c.name === "ConverseCommand" ? converseReply : anthropicReply()));
+  const tcfg: Config = { ...cfg, aliases: { ...cfg.aliases, "auto-oss": "auto:openai" } };
+  await withServer(tcfg, client, async (post) => {
+    const server = createServer(tcfg, client);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const r1 = await fetch(base + "/v1/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(req("design the schema")) });
+      assert.equal(r1.headers.get("x-bedrouter-model"), "opus");
+      assert.equal(r1.headers.get("x-bedrouter-requested"), "sonnet");
+      assert.equal(r1.headers.get("x-bedrouter-class"), "explore");
+      assert.equal(r1.headers.get("x-bedrouter-reason"), "keyword:explore");
+      const key = r1.headers.get("x-bedrouter-conversation")!;
+      assert.match(key, /^[0-9a-f]{16}$/);
+      const r2 = await fetch(base + "/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "auto-oss", stream: true, messages: [{ role: "user", content: "implement it" }] }) });
+      await r2.text();
+      assert.deepEqual([r2.headers.get("x-bedrouter-model"), r2.headers.get("x-bedrouter-class"), r2.headers.get("content-type")], ["gpt-oss-20b", "execute", "text/event-stream"]);
+      const health = await (await fetch(base + "/health")).json();
+      assert.ok(health.ok && health.pid === process.pid && typeof health.version === "string");
+      const models = await (await fetch(base + "/v1/models")).json();
+      const auto = models.data.find((m: any) => m.id === "auto-oss");
+      assert.deepEqual(auto.bedrouter, { family: "openai", rung: "gpt-oss-20b", auto: true, inputPerM: 0.07, outputPerM: 0.2 });
+      await new Promise((r) => setTimeout(r, 20));
+      const conv = await (await fetch(base + `/v1/conversations/${key}`)).json();
+      assert.deepEqual([conv.requests, conv.routedModel, conv.requestedModel, conv.class], [1, "opus", "sonnet", "explore"]);
+      assert.ok(conv.costUsd > 0 && conv.requestedCostUsd > 0 && conv.requestedCostUsd < conv.costUsd);
+      assert.equal((await fetch(base + "/v1/conversations/nope")).status, 404);
+    } finally { server.close(); }
+    void post;
+  });
+});

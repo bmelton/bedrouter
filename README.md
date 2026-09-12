@@ -53,13 +53,15 @@ Requires Node 20+, the AWS CLI (for `aws sso login`), and an AWS principal allow
 
 ```sh
 git clone <this repo> && cd bedrouter
-npm install
+npm install                   # also builds dist/ (the `bedrouter` binary)
 cp .env.example .env          # set AWS_PROFILE for this machine (see Credentials)
 aws sso login --profile bedrouter
 npm run doctor                # which credentials resolved, loaded ladder
 npm run doctor -- --probe     # 1-token call per rung: which models THIS account can actually invoke
-npm start                     # http://127.0.0.1:20129
+npm start                     # http://127.0.0.1:20129   (npm run start:debug prints every decision)
 ```
+
+Installed as a dependency (`npm install github:bmelton/bedrouter`) the same things are `bedrouter serve|doctor|report|smoke`, run from a directory that holds `.env` and `bedrouter.json`. Pi users: the [pi-bedrouter](https://github.com/bmelton/pi-bedrouter) extension installs, starts and configures all of this from inside Pi.
 
 `npm start` runs the credential check first and refuses to start when nothing resolves, printing the command that fixes it. The committed `bedrouter.example.json` is used until you copy it to `bedrouter.json` (gitignored) to match your account: the probe tells you which rungs to swap. Frontier models are not entitled on every account; a personal account may have Haiku 4.5 and Opus 4.7/4.8 but not Opus 5, for instance.
 
@@ -180,8 +182,11 @@ Base URL `http://127.0.0.1:20129/v1`, API key anything (or `BEDROUTER_API_KEY`),
 | --- | --- | --- |
 | `POST /v1/messages` | Anthropic Messages API, streaming and non-streaming | Native passthrough: `InvokeModel` / `InvokeModelWithResponseStream`. Anthropic family only (a 400 says so) |
 | `POST /v1/chat/completions` | OpenAI chat completions, streaming and non-streaming | Translated to `Converse` / `ConverseStream`; any family |
-| `GET /v1/models` | OpenAI model list | The configured aliases and rungs |
-| `GET /health` | | `{ ok, region }` |
+| `GET /v1/models` | OpenAI model list | The configured aliases and rungs, each with a `bedrouter: { family, rung, auto, inputPerM, outputPerM }` block |
+| `GET /v1/conversations/:key` | | Running totals for one conversation (requests, cost, requested cost, classifier cost, tokens, escalations, current class/rung); `GET /v1/conversations` lists the last 50 |
+| `GET /health` | | `{ ok, region, pid, version, routing, classifier, uptimeS }` |
+
+Every routed response also carries the decision in headers, so clients can show it live without reading the log: `x-bedrouter-model` (routed rung), `x-bedrouter-requested`, `x-bedrouter-bedrock-id`, `x-bedrouter-class`, `x-bedrouter-reason`, `x-bedrouter-conversation` (key for the endpoint above) and `x-bedrouter-classifier` (the classifier's note, when it ran). [pi-bedrouter](https://github.com/bmelton/pi-bedrouter) uses these for its footer.
 
 A request naming a model that is not in the config gets a 404 listing the valid names. There is never a silent fallback.
 
@@ -405,7 +410,7 @@ npm run smoke          # one small streaming request per endpoint against real B
 npm run report         # savings report over the decision log
 ```
 
-Layout: `src/env.ts` (loads `.env`, imported first), `src/preflight.ts` (credential check, friendly SSO errors), `src/config.ts` (model map, aliases, cost), `src/router.ts` (rules, sticky map, upgrades, escalation; pure, no I/O), `src/classifier.ts` (classifier prompt, parsing, the one Converse call), `src/translate.ts` (OpenAI ↔ Converse, pure), `src/server.ts` (routes, Bedrock calls, decision log). `createServer(cfg, client)` takes a fake Bedrock client, which is how the server tests run without credentials. Single runtime dependency (`@aws-sdk/client-bedrock-runtime`), stdlib `http`, no framework; deliberate ceilings are marked `// ponytail:` in source.
+Layout: `src/cli.ts` (the `bedrouter` binary: serve/doctor/report/smoke), `src/env.ts` (loads `.env`, imported first), `src/preflight.ts` (credential check, friendly SSO errors), `src/config.ts` (model map, aliases, cost), `src/router.ts` (rules, sticky map, upgrades, escalation; pure, no I/O), `src/classifier.ts` (classifier prompt, parsing, the one Converse call), `src/translate.ts` (OpenAI ↔ Converse, pure), `src/server.ts` (routes, Bedrock calls, decision log, conversation tallies), `src/doctor.ts` / `src/report.ts` / `src/smoke.ts`. `npm run build` emits `dist/` (gitignored; built by `prepare` on install). `createServer(cfg, client)` takes a fake Bedrock client, which is how the server tests run without credentials. Single runtime dependency (`@aws-sdk/client-bedrock-runtime`), stdlib `http`, no framework; deliberate ceilings are marked `// ponytail:` in source.
 
 Pi integration is deliberately not in this repo; it lives in the separate `pi-bedrouter` package, which expects a running bedrouter.
 
