@@ -1,0 +1,18 @@
+flowchart LR
+    CC["Claude Code / Pi<br/>(Anthropic Messages shape)"] -->|"POST /v1/messages"| A
+    OA["Pi / Codex / Cursor / Cline / any OpenAI client<br/>(chat completions shape)"] -->|"POST /v1/chat/completions"| A
+
+    subgraph Bedrouter ["bedrouter (127.0.0.1:20129)"]
+        A["resolve model / auto<br/>→ family + floor"] --> R["rules: sticky? · thinking · shape · keywords · trivial"]
+        R -->|"undecided"| M["classifier model\n(haiku, one short call per conversation)"]
+        R -->|"decided"| X
+        M --> X["rung in the family\ntrivial / execute / explore"]
+        X -->|"Anthropic shape → Claude"| P["native passthrough\nInvokeModel"]
+        X -->|"OpenAI shape → any family"| T["translate\nOpenAI ↔ Converse"]
+        P --> O["observe response:\nescalate on failure"]
+        T --> O
+        O --> L["decision log\nbedrouter.log.jsonl"]
+    end
+
+    P --> B["AWS Bedrock\nus.anthropic.claude-* · openai.gpt-oss-*"]
+    T --> B
