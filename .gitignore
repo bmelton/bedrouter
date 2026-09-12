@@ -3,3 +3,4 @@ dist/
 bedrouter.json
 bedrouter.log.jsonl
 .env
+server.log
