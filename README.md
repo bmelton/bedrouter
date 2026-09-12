@@ -115,7 +115,7 @@ sso_role_name = BedrockInvoke
 region = us-east-1
 ```
 
-Corporate SSO: run `aws configure sso`, accept whatever profile name it generates (for example `BAHSSO_123456_ADMIN`; the profile name is arbitrary, `sso_role_name` is what matters) and put that name in `.env` as `AWS_PROFILE`.
+Corporate SSO: run `aws configure sso`, accept whatever profile name it generates (the profile name is arbitrary, `sso_role_name` is what matters) and put that name in `.env` as `AWS_PROFILE`.
 
 Setting up the personal side from scratch (console, about ten minutes): enable IAM Identity Center (organization instance, single region), add a user, create a permission set whose inline policy allows `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` (plus the read-only `bedrock:List*`/`Get*` above), and assign user + permission set to the account. Then submit Anthropic's one-time use-case form from the Bedrock model catalog and make one call to a Claude model in the console playground as an admin, which performs the Marketplace auto-subscription a restricted permission set cannot. Serverless models no longer need per-model "model access" requests, but entitlement to frontier models varies by account; `npm run doctor -- --probe` shows what you have.
 
