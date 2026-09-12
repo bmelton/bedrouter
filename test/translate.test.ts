@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { converseEventToOpenai, converseToOpenai, newStreamState, openaiToConverse } from "../src/translate.js";
+import { converseEventToOpenai, converseToOpenai, converseToolName, newStreamState, openaiToConverse, toolNameMap } from "../src/translate.js";
 
 test("openaiToConverse: system, tools, tool calls and tool results", () => {
   const input = openaiToConverse(
@@ -113,4 +113,34 @@ test("converseEventToOpenai: streaming assembly of text, tool call args, finish 
   for (const c of chunks) { assert.equal(c.id, "chatcmpl-s"); assert.equal(c.object, "chat.completion.chunk"); }
   assert.equal(st.stopReason, "tool_use");
   assert.throws(() => converseEventToOpenai(st, { throttlingException: { name: "ThrottlingException", message: "slow down", $fault: "client", $metadata: {} } } as never), /slow down/);
+});
+
+test("tool names are made Converse-safe in history, definitions and tool_choice, and mapped back in responses", async () => {
+  const body = {
+    model: "gpt-oss-20b",
+    tools: [{ type: "function", function: { name: "web.search", parameters: {} } }, { type: "function", function: { name: "read_file", parameters: {} } }],
+    tool_choice: { type: "function", function: { name: "web.search" } },
+    messages: [
+      { role: "user", content: "hi" },
+      // a hallucinated call that no tool defines: Converse would reject "web_search.json" forever after
+      { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "web_search.json", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", content: "Tool web_search.json not found" },
+    ],
+  };
+  const input = openaiToConverse(body, "m");
+  assert.deepEqual(input.toolConfig!.tools!.map((t: any) => t.toolSpec.name), ["web_search", "read_file"]);
+  assert.deepEqual(input.toolConfig!.toolChoice, { tool: { name: "web_search" } });
+  const assistant = input.messages!.find((m) => m.role === "assistant")!;
+  assert.equal((assistant.content![0] as any).toolUse.name, "web_search_json");
+  for (const name of ["web_search", "read_file", "web_search_json"]) assert.match(name, /^[a-zA-Z0-9_-]+$/);
+  assert.equal(converseToolName("x".repeat(80)).length, 64);
+  assert.equal(converseToolName(""), "tool");
+  // responses carry the client's original name for defined tools
+  const names = toolNameMap(body);
+  assert.deepEqual([...names], [["web_search", "web.search"]]);
+  const out: any = { output: { message: { role: "assistant", content: [{ toolUse: { toolUseId: "t1", name: "web_search", input: { q: 1 } } }] } }, stopReason: "tool_use", usage: { inputTokens: 1, outputTokens: 1 } };
+  assert.equal(converseToOpenai(out, "gpt-oss-20b", "id", names).choices[0].message.tool_calls[0].function.name, "web.search");
+  const st = newStreamState("gpt-oss-20b", "id", names);
+  const chunks = converseEventToOpenai(st, { contentBlockStart: { contentBlockIndex: 0, start: { toolUse: { toolUseId: "t1", name: "web_search" } } } } as any);
+  assert.equal(chunks[0].choices[0].delta.tool_calls[0].function.name, "web.search");
 });

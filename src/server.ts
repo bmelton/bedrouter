@@ -10,7 +10,7 @@ import {
   InvokeModelWithResponseStreamCommand,
 } from "@aws-sdk/client-bedrock-runtime";
 import { estimateCost, loadConfig, modelTable, resolveModel, type Config, type Rung, type Usage } from "./config.js";
-import { ClientError, converseEventToOpenai, converseToOpenai, newStreamState, openaiToConverse, toError } from "./translate.js";
+import { ClientError, converseEventToOpenai, converseToOpenai, newStreamState, openaiToConverse, toError, toolNameMap } from "./translate.js";
 import { Router, ToolJsonCheck, type Class, type Decision } from "./router.js";
 import { describe, preflight } from "./preflight.js";
 import { classifyWithModel } from "./classifier.js";
@@ -241,6 +241,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
   async function handleChat(req: http.IncomingMessage, res: http.ServerResponse, body: Json, log: LogEntry, ac: AbortController, rt: RouteCtx) {
     const rung = await route(req, body, log, rt);
     const input = openaiToConverse(body, rung.bedrockId);
+    const names = toolNameMap(body);
     const id = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     const usageOf = (u: Json): Usage => ({ input: u?.inputTokens ?? 0, output: u?.outputTokens ?? 0, cacheRead: u?.cacheReadInputTokens, cacheWrite: u?.cacheWriteInputTokens });
 
@@ -249,12 +250,12 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       log.stopReason = out.stopReason ?? null;
       finishUsage(log, rung, usageOf(out.usage), rt);
       for (const [k, v] of Object.entries(decisionHeaders(log))) res.setHeader(k, v);
-      return sendJson(res, 200, converseToOpenai(out, body.model, id));
+      return sendJson(res, 200, converseToOpenai(out, body.model, id, names));
     }
 
     const out = await client.send(new ConverseStreamCommand(input), { abortSignal: ac.signal });
     startSse(res, decisionHeaders(log));
-    const st = newStreamState(body.model, id);
+    const st = newStreamState(body.model, id, names);
     for await (const ev of out.stream ?? []) {
       if (ev.contentBlockDelta?.delta?.toolUse) rt.tools.add(ev.contentBlockDelta.contentBlockIndex ?? 0, ev.contentBlockDelta.delta.toolUse.input ?? "");
       for (const chunk of converseEventToOpenai(st, ev)) res.write(`data: ${JSON.stringify(chunk)}\n\n`);

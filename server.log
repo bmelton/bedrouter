@@ -47,3 +47,31 @@ bedrouter listening on http://127.0.0.1:20129  (debug: printing every request)
   routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · sticky]  conv=22aad48ef1816753
           openai.gpt-oss-20b-1:0
   ← end_turn  in 19.2k  out 833  2743 ms  $0.00151
+
+--- pi-bedrouter start 2026-09-12T16:03:57.700Z ---
+bedrouter: credentials: profile "bedrouter" (~/.aws/config), region us-east-1, expires 2026-09-13T04:03:57.000Z (720 min)
+bedrouter listening on http://127.0.0.1:20129  (debug: printing every request)
+
+--- pi-bedrouter start 2026-09-12T16:29:15.083Z ---
+bedrouter: credentials: profile "bedrouter" (~/.aws/config), region us-east-1, expires 2026-09-13T04:29:14.000Z (720 min)
+bedrouter listening on http://127.0.0.1:20129  (debug: printing every request)
+
+→ 16:41:11 /v1/chat/completions  model=auto-oss  2 msgs  20 tools  ~17.6k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · classifier:trivial]  conv=57cd5e1538f2dc9d  classifier: "package installation command, straightforward execution with known outcome" 857 ms $0.00044
+          openai.gpt-oss-20b-1:0
+  ← tool_use  in 16.4k  out 142  3336 ms  $0.00118
+
+→ 16:41:16 /v1/chat/completions  model=auto-oss  4 msgs  20 tools  ~18.0k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · sticky]  conv=57cd5e1538f2dc9d
+          openai.gpt-oss-20b-1:0
+  ← tool_use  in 16.6k  out 108  2291 ms  $0.00118
+
+→ 16:41:18 /v1/chat/completions  model=auto-oss  6 msgs  20 tools  ~18.1k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · sticky]  conv=57cd5e1538f2dc9d
+          openai.gpt-oss-20b-1:0
+  ✗ 114 ms  1 validation error detected: Value at 'messages.4.member.content.1.member.toolUse.name' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_-]+
+
+→ 16:41:50 /v1/chat/completions  model=auto-oss  7 msgs  20 tools  ~18.2k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · sticky]  conv=57cd5e1538f2dc9d
+          openai.gpt-oss-20b-1:0
+  ✗ 118 ms  1 validation error detected: Value at 'messages.4.member.content.1.member.toolUse.name' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_-]+

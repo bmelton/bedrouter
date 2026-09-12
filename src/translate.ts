@@ -43,6 +43,28 @@ function toolResultText(content: Json): string {
 
 export class ClientError extends Error {}
 
+/**
+ * Converse requires tool names to match [a-zA-Z0-9_-]+ (max 64). OpenAI and Anthropic clients do not, and a model can
+ * hallucinate a call like "web_search.json" that then sits in the history forever; without this every later turn of the
+ * conversation would be rejected with a ValidationException. Invalid characters become "_".
+ */
+export function converseToolName(name: unknown): string {
+  const safe = String(name ?? "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+  return safe || "tool";
+}
+
+/** safe name -> client's original name for every *defined* tool whose name had to change, so responses can be mapped back. */
+export function toolNameMap(body: Json): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const t of body?.tools ?? []) {
+    const name = t?.function?.name;
+    if (typeof name !== "string") continue;
+    const safe = converseToolName(name);
+    if (safe !== name) map.set(safe, name);
+  }
+  return map;
+}
+
 /** SDK event-stream exception members are typed as Errors but deserialise as plain objects in some paths. */
 export const toError = (e: Json): Error => (e instanceof Error ? e : Object.assign(new Error(e?.message ?? String(e)), e));
 
@@ -74,7 +96,7 @@ export function openaiToConverse(body: Json, modelId: string): ConverseCommandIn
         for (const tc of m.tool_calls ?? []) {
           let input: Json = {};
           try { input = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {}; } catch { input = { _raw: tc.function.arguments }; }
-          blocks.push({ toolUse: { toolUseId: tc.id, name: tc.function?.name, input } });
+          blocks.push({ toolUse: { toolUseId: tc.id, name: converseToolName(tc.function?.name), input } });
         }
         push("assistant", blocks);
         break;
@@ -102,12 +124,12 @@ export function openaiToConverse(body: Json, modelId: string): ConverseCommandIn
   if (tools.length && body.tool_choice !== "none") {
     const toolConfig: ToolConfiguration = {
       tools: tools.map((t: Json) => ({
-        toolSpec: { name: t.function.name, description: t.function.description, inputSchema: { json: t.function.parameters ?? { type: "object", properties: {} } } },
+        toolSpec: { name: converseToolName(t.function.name), description: t.function.description, inputSchema: { json: t.function.parameters ?? { type: "object", properties: {} } } },
       })),
     };
     const tc = body.tool_choice;
     if (tc === "required") toolConfig.toolChoice = { any: {} };
-    else if (tc?.type === "function") toolConfig.toolChoice = { tool: { name: tc.function.name } };
+    else if (tc?.type === "function") toolConfig.toolChoice = { tool: { name: converseToolName(tc.function.name) } };
     input.toolConfig = toolConfig;
   }
   return input;
@@ -130,13 +152,13 @@ export function usageToOpenai(u?: TokenUsage) {
   return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion };
 }
 
-export function converseToOpenai(out: ConverseCommandOutput, model: string, id: string) {
+export function converseToOpenai(out: ConverseCommandOutput, model: string, id: string, names: Map<string, string> = new Map()) {
   const blocks = out.output?.message?.content ?? [];
   const text = blocks.map((b) => b.text ?? "").join("");
   const reasoning = blocks.map((b) => b.reasoningContent?.reasoningText?.text ?? "").join("");
   const tool_calls = blocks
     .filter((b) => b.toolUse)
-    .map((b) => ({ id: b.toolUse!.toolUseId, type: "function", function: { name: b.toolUse!.name, arguments: JSON.stringify(b.toolUse!.input ?? {}) } }));
+    .map((b) => ({ id: b.toolUse!.toolUseId, type: "function", function: { name: names.get(b.toolUse!.name!) ?? b.toolUse!.name, arguments: JSON.stringify(b.toolUse!.input ?? {}) } }));
   const message: Json = { role: "assistant", content: text || null };
   if (reasoning) message.reasoning_content = reasoning;
   if (tool_calls.length) message.tool_calls = tool_calls;
@@ -155,12 +177,13 @@ export type StreamState = {
   model: string;
   created: number;
   toolIndex: Map<number, number>; // converse contentBlockIndex -> openai tool_calls index
+  names: Map<string, string>;     // converse-safe tool name -> the client's original name
   stopReason?: string;
   usage?: TokenUsage;
 };
 
-export const newStreamState = (model: string, id: string): StreamState => ({
-  id, model, created: Math.floor(Date.now() / 1000), toolIndex: new Map(),
+export const newStreamState = (model: string, id: string, names: Map<string, string> = new Map()): StreamState => ({
+  id, model, created: Math.floor(Date.now() / 1000), toolIndex: new Map(), names,
 });
 
 /** Translate one ConverseStream event into zero or more chat.completion.chunk objects. Throws on stream exceptions. */
@@ -176,7 +199,7 @@ export function converseEventToOpenai(st: StreamState, ev: ConverseStreamOutput)
     if (!tu) return [];
     const index = st.toolIndex.size;
     st.toolIndex.set(ev.contentBlockStart.contentBlockIndex!, index);
-    return [chunk({ tool_calls: [{ index, id: tu.toolUseId, type: "function", function: { name: tu.name, arguments: "" } }] })];
+    return [chunk({ tool_calls: [{ index, id: tu.toolUseId, type: "function", function: { name: st.names.get(tu.name!) ?? tu.name, arguments: "" } }] })];
   }
   if (ev.contentBlockDelta) {
     const d = ev.contentBlockDelta.delta;
