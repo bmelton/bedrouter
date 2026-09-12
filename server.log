@@ -1,0 +1,49 @@
+
+--- pi-bedrouter start 2026-09-12T14:35:00.742Z ---
+bedrouter: credentials: profile "bedrouter" (~/.aws/config), region us-east-1, expires 2026-09-13T02:35:00.000Z (720 min)
+bedrouter listening on http://127.0.0.1:20129  (debug: printing every request)
+
+→ 14:38:19 /v1/chat/completions  model=auto-oss  2 msgs  20 tools  ~17.6k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · classifier:trivial]  conv=22aad48ef1816753  classifier: "package installation command, straightforward execution with known outcome" 910 ms $0.00044
+          openai.gpt-oss-20b-1:0
+  ← tool_use  in 16.4k  out 139  2131 ms  $0.00117
+
+→ 14:38:33 /v1/chat/completions  model=auto-oss  4 msgs  20 tools  ~18.1k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · sticky]  conv=22aad48ef1816753
+          openai.gpt-oss-20b-1:0
+  ← end_turn  in 16.8k  out 145  2503 ms  $0.00120
+
+→ 15:05:09 /v1/chat/completions  model=auto-oss  6 msgs  20 tools  ~18.3k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · sticky]  conv=22aad48ef1816753
+          openai.gpt-oss-20b-1:0
+  ← tool_use  in 16.9k  out 39  759 ms  $0.00119
+
+→ 15:05:11 /v1/chat/completions  model=auto-oss  8 msgs  20 tools  ~18.5k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · sticky]  conv=22aad48ef1816753
+          openai.gpt-oss-20b-1:0
+  ← tool_use  in 17.0k  out 65  1015 ms  $0.00120
+
+→ 15:05:12 /v1/chat/completions  model=auto-oss  10 msgs  20 tools  ~18.8k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · sticky]  conv=22aad48ef1816753
+          openai.gpt-oss-20b-1:0
+  ← tool_use  in 17.2k  out 33  454 ms  $0.00121
+
+→ 15:05:13 /v1/chat/completions  model=auto-oss  12 msgs  20 tools  ~19.0k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · sticky]  conv=22aad48ef1816753
+          openai.gpt-oss-20b-1:0
+  ← end_turn  in 17.4k  out 349  2680 ms  $0.00129
+
+→ 15:05:23 /v1/chat/completions  model=auto-oss  14 msgs  20 tools  ~19.4k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · sticky]  conv=22aad48ef1816753
+          openai.gpt-oss-20b-1:0
+  ← tool_use  in 17.6k  out 41  694 ms  $0.00124
+
+→ 15:05:31 /v1/chat/completions  model=auto-oss  16 msgs  20 tools  ~20.4k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · sticky]  conv=22aad48ef1816753
+          openai.gpt-oss-20b-1:0
+  ← tool_use  in 18.8k  out 113  1255 ms  $0.00134
+
+→ 15:05:36 /v1/chat/completions  model=auto-oss  18 msgs  20 tools  ~20.9k tok  stream
+  routed  gpt-oss-20b (auto) => gpt-oss-20b  [execute · sticky]  conv=22aad48ef1816753
+          openai.gpt-oss-20b-1:0
+  ← end_turn  in 19.2k  out 833  2743 ms  $0.00151

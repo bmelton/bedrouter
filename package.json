@@ -2,11 +2,48 @@
   "name": "bedrouter",
   "version": "0.1.0",
   "description": "Local OpenAI/Anthropic-compatible proxy in front of AWS Bedrock",
+  "keywords": [
+    "bedrock",
+    "aws",
+    "model-router",
+    "proxy",
+    "anthropic",
+    "claude",
+    "gpt-oss",
+    "cost",
+    "llm",
+    "claude-code",
+    "pi"
+  ],
+  "license": "MIT",
+  "author": "Barry Melton",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bmelton/bedrouter.git"
+  },
+  "homepage": "https://github.com/bmelton/bedrouter#readme",
+  "bugs": {
+    "url": "https://github.com/bmelton/bedrouter/issues"
+  },
   "type": "module",
-  "private": true,
   "engines": {
     "node": ">=20"
   },
+  "bin": {
+    "bedrouter": "dist/cli.js"
+  },
+  "exports": {
+    "./package.json": "./package.json",
+    "./bedrouter.example.json": "./bedrouter.example.json",
+    "./.env.example": "./.env.example"
+  },
+  "files": [
+    "dist",
+    "bedrouter.example.json",
+    ".env.example",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "tsx src/cli.ts",
     "start:debug": "tsx src/cli.ts --debug",
@@ -17,7 +54,8 @@
     "doctor": "tsx src/cli.ts doctor",
     "report": "tsx src/cli.ts report",
     "build": "tsc -p tsconfig.build.json",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "prepublishOnly": "npm test && npm run typecheck && npm run build"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.900.0"
@@ -26,19 +64,5 @@
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
-  },
-  "bin": {
-    "bedrouter": "dist/cli.js"
-  },
-  "files": [
-    "dist",
-    "bedrouter.example.json",
-    ".env.example",
-    "README.md"
-  ],
-  "exports": {
-    "./package.json": "./package.json",
-    "./bedrouter.example.json": "./bedrouter.example.json",
-    "./.env.example": "./.env.example"
   }
 }
