@@ -2,14 +2,44 @@
   "_pricing": "USD per 1M tokens for the us.* cross-region profiles: Anthropic's published Bedrock rates plus the 10% regional premium (https://aws.amazon.com/bedrock/pricing/, https://platform.claude.com/docs/en/about-claude/pricing). gpt-oss rows are the US East on-demand rates from the Bedrock pricing page.",
   "families": {
     "anthropic": [
-      { "alias": "haiku",  "bedrockId": "us.anthropic.claude-haiku-4-5-20251001-v1:0", "inputPerM": 1.1,  "outputPerM": 5.5 },
-      { "alias": "sonnet", "bedrockId": "us.anthropic.claude-sonnet-5",                "inputPerM": 2.2,  "outputPerM": 11 },
-      { "alias": "opus",   "bedrockId": "us.anthropic.claude-opus-5",                  "inputPerM": 5.5,  "outputPerM": 27.5 },
-      { "alias": "fable",  "bedrockId": "us.anthropic.claude-fable-5-1",               "inputPerM": 11,   "outputPerM": 55 }
+      {
+        "alias": "haiku",
+        "bedrockId": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "inputPerM": 1.1,
+        "outputPerM": 5.5
+      },
+      {
+        "alias": "sonnet",
+        "bedrockId": "us.anthropic.claude-sonnet-5",
+        "inputPerM": 2.2,
+        "outputPerM": 11
+      },
+      {
+        "alias": "opus",
+        "bedrockId": "us.anthropic.claude-opus-5",
+        "inputPerM": 5.5,
+        "outputPerM": 27.5
+      },
+      {
+        "alias": "fable",
+        "bedrockId": "us.anthropic.claude-fable-5-1",
+        "inputPerM": 11,
+        "outputPerM": 55
+      }
     ],
     "openai": [
-      { "alias": "gpt-oss-20b",  "bedrockId": "openai.gpt-oss-20b-1:0",  "inputPerM": 0.07, "outputPerM": 0.2 },
-      { "alias": "gpt-oss-120b", "bedrockId": "openai.gpt-oss-120b-1:0", "inputPerM": 0.15, "outputPerM": 0.6 }
+      {
+        "alias": "gpt-oss-20b",
+        "bedrockId": "openai.gpt-oss-20b-1:0",
+        "inputPerM": 0.07,
+        "outputPerM": 0.2
+      },
+      {
+        "alias": "gpt-oss-120b",
+        "bedrockId": "openai.gpt-oss-120b-1:0",
+        "inputPerM": 0.15,
+        "outputPerM": 0.6
+      }
     ]
   },
   "aliases": {
@@ -18,21 +48,75 @@
     "claude-sonnet-5": "sonnet",
     "claude-opus-5": "opus",
     "claude-fable-5-1": "fable",
-    "gpt-oss": "gpt-oss-120b"
+    "gpt-oss": "gpt-oss-120b",
+    "auto": "auto:anthropic",
+    "auto-oss": "auto:openai"
   },
   "routing": {
     "enabled": true,
     "honorClientModel": true,
+    "trivialBelowFloor": true,
+    "upgradeOnIntent": true,
+    "classifier": {
+      "enabled": true,
+      "model": "haiku",
+      "mode": "fallback",
+      "maxChars": 4000,
+      "timeoutMs": 4000
+    },
     "maxConversations": 1000,
     "retryWindowMs": 60000,
     "classes": {
-      "anthropic": { "execute": "sonnet",      "explore": "opus" },
-      "openai":    { "execute": "gpt-oss-20b", "explore": "gpt-oss-120b" }
+      "anthropic": {
+        "trivial": "haiku",
+        "execute": "sonnet",
+        "explore": "opus"
+      },
+      "openai": {
+        "execute": "gpt-oss-20b",
+        "explore": "gpt-oss-120b"
+      }
     },
-    "shape": { "exploreInputTokens": 60000, "exploreTools": 40, "executeTurns": 8, "executeLastUserChars": 200 },
+    "shape": {
+      "exploreInputTokens": 60000,
+      "exploreTools": 40,
+      "executeTurns": 8,
+      "executeLastUserChars": 200,
+      "trivialMaxChars": 300,
+      "trivialMaxInputTokens": 1500
+    },
     "keywords": {
-      "explore": ["design", "architect", "architecture", "plan", "investigate", "why", "compare", "tradeoff", "trade-off", "refactor the whole", "explore", "research", "evaluate", "propose", "brainstorm"],
-      "execute": ["implement", "fix", "add test", "add a test", "rename", "update", "apply", "bump", "write", "change", "remove", "delete"]
+      "explore": [
+        "design",
+        "architect",
+        "architecture",
+        "plan",
+        "investigate",
+        "why",
+        "compare",
+        "tradeoff",
+        "trade-off",
+        "refactor the whole",
+        "explore",
+        "research",
+        "evaluate",
+        "propose",
+        "brainstorm"
+      ],
+      "execute": [
+        "implement",
+        "fix",
+        "add test",
+        "add a test",
+        "rename",
+        "update",
+        "apply",
+        "bump",
+        "write",
+        "change",
+        "remove",
+        "delete"
+      ]
     }
   }
 }

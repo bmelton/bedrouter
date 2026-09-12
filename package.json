@@ -7,10 +7,13 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "start": "tsx src/server.ts",
+    "start:debug": "tsx src/server.ts --debug",
     "dev": "tsx watch src/server.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
-    "smoke": "tsx scripts/smoke.ts"
+    "smoke": "tsx scripts/smoke.ts",
+    "doctor": "tsx scripts/doctor.ts",
+    "report": "tsx scripts/report.ts"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.900.0"

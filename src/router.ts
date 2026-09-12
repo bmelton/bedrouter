@@ -6,30 +6,38 @@ import type { Config, Family, Rung } from "./config.js";
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Json = any;
 
-export type Class = "execute" | "explore";
+export type Class = "trivial" | "execute" | "explore";
 
 export type RoutingConfig = {
   enabled: boolean;
   honorClientModel: boolean;
+  trivialBelowFloor: boolean;
+  upgradeOnIntent: boolean;
+  classifier: { enabled: boolean; model: string | null; mode: "fallback" | "always"; maxChars: number; timeoutMs: number };
   maxConversations: number;
   retryWindowMs: number;
-  classes: Partial<Record<Family, Record<Class, string>>>;
-  shape: { exploreInputTokens: number; exploreTools: number; executeTurns: number; executeLastUserChars: number };
-  keywords: Record<Class, string[]>;
+  classes: Partial<Record<Family, Partial<Record<Class, string>> & Record<"execute" | "explore", string>>>;
+  shape: { exploreInputTokens: number; exploreTools: number; executeTurns: number; executeLastUserChars: number; trivialMaxChars: number; trivialMaxInputTokens: number };
+  keywords: Record<"execute" | "explore", string[]>;
 };
 
 export const ROUTING_DEFAULTS: RoutingConfig = {
   enabled: false, // absent block = router off, so an existing bedrouter.json keeps today's behaviour
   honorClientModel: true,
+  trivialBelowFloor: true,
+  upgradeOnIntent: true,
+  classifier: { enabled: false, model: null, mode: "fallback", maxChars: 4000, timeoutMs: 4000 },
   maxConversations: 1000,
   retryWindowMs: 60_000,
   classes: {},
-  shape: { exploreInputTokens: 60_000, exploreTools: 40, executeTurns: 8, executeLastUserChars: 200 },
+  shape: { exploreInputTokens: 60_000, exploreTools: 40, executeTurns: 8, executeLastUserChars: 200, trivialMaxChars: 300, trivialMaxInputTokens: 1_500 },
   keywords: { explore: [], execute: [] },
 };
 
 export type Decision = {
   rung: Rung;
+  /** True when the rules did not find a decisive signal and a model classifier (if configured) should have a say. */
+  undecided: boolean;
   class: Class | null;
   classReason: string;
   conversationKey: string | null; // null = not tracked (router off, bypass, or pinned cheap rung)
@@ -60,6 +68,8 @@ export function promptShape(body: Json) {
     firstUser: stripReminders(text(users[0]?.content)),
     lastUser: stripReminders(text(users[users.length - 1]?.content)).trim(),
     turns: messages.length,
+    // conversation turns excluding system/developer messages: 1 means "the opening ask, nothing has happened yet"
+    dialogTurns: messages.length - systemMsgs.length,
     tools: Array.isArray(body.tools) ? body.tools.length : 0,
     // ponytail: chars/4 token estimate over the whole body; use the model's tokenizer if thresholds need precision.
     inputTokens: Math.ceil(JSON.stringify(body).length / 4),
@@ -72,6 +82,16 @@ const wordRe = (words: string[]) =>
   words.length ? new RegExp(`\\b(${words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\b`, "i") : /$^/;
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+const RANK: Record<Class, number> = { trivial: 0, execute: 1, explore: 2 };
+
+/** True when the last message is the user typing (text), not a tool result the client is feeding back. */
+const isUserTurn = (body: Json): boolean => {
+  const messages: Json[] = Array.isArray(body.messages) ? body.messages : [];
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== "user") return false;
+  if (typeof last.content === "string") return true;
+  return Array.isArray(last.content) && last.content.some((p: Json) => p?.type === "text") && !last.content.some((p: Json) => p?.type === "tool_result");
+};
 
 export class Router {
   readonly rc: RoutingConfig;
@@ -81,9 +101,10 @@ export class Router {
 
   constructor(private readonly cfg: Config) {
     const r = cfg.routing ?? {};
-    this.rc = { ...ROUTING_DEFAULTS, ...r, shape: { ...ROUTING_DEFAULTS.shape, ...r.shape }, keywords: { ...ROUTING_DEFAULTS.keywords, ...r.keywords } };
-    for (const [family, classes] of Object.entries(this.rc.classes) as [Family, Record<Class, string>][]) {
-      for (const [cls, alias] of Object.entries(classes)) {
+    this.rc = { ...ROUTING_DEFAULTS, ...r, shape: { ...ROUTING_DEFAULTS.shape, ...r.shape }, keywords: { ...ROUTING_DEFAULTS.keywords, ...r.keywords }, classifier: { ...ROUTING_DEFAULTS.classifier, ...r.classifier } };
+    if (this.rc.classifier.enabled && !this.rc.classifier.model) throw new Error("routing.classifier.model is required when the classifier is enabled");
+    for (const [family, classes] of Object.entries(this.rc.classes) as [Family, Partial<Record<Class, string>>][]) {
+      for (const [cls, alias] of Object.entries(classes) as [Class, string][]) {
         if (!cfg.families[family]?.some((x) => x.alias === alias)) throw new Error(`routing.classes.${family}.${cls}: "${alias}" is not a rung in that family`);
       }
     }
@@ -91,14 +112,20 @@ export class Router {
     this.execute = wordRe(this.rc.keywords.execute);
   }
 
-  /** Signals 2-4 in order; the client-model signal (1) lives in route() because it needs the ladder. */
-  classify(body: Json, s = promptShape(body)): { class: Class; reason: string } {
+  /**
+   * Signals 2-5 in order; the client-model signal (1) lives in route() because it needs the ladder.
+   * `trivial` is only considered when the family has a trivial rung (route() passes that in).
+   */
+  classify(body: Json, s = promptShape(body), allowTrivial = false): { class: Class; reason: string } {
     const { shape } = this.rc;
     if (s.thinking) return { class: "explore", reason: "thinking" };
     if (s.inputTokens >= shape.exploreInputTokens) return { class: "explore", reason: "shape:long-context" };
     if (s.tools >= shape.exploreTools) return { class: "explore", reason: "shape:many-tools" };
     if (s.turns >= shape.executeTurns && s.lastUser.length <= shape.executeLastUserChars) return { class: "execute", reason: "shape:agentic-loop" };
     if (this.explore.test(s.lastUser)) return { class: "explore", reason: "keyword:explore" };
+    // Trivial: the opening ask of a conversation, short, no tools, small context. Titles, one-line questions, summaries.
+    if (allowTrivial && s.dialogTurns <= 1 && s.tools === 0 && s.lastUser.length > 0 && s.lastUser.length <= shape.trivialMaxChars && s.inputTokens <= shape.trivialMaxInputTokens)
+      return { class: "trivial", reason: "shape:trivial" };
     if (this.execute.test(s.lastUser)) return { class: "execute", reason: "keyword:execute" };
     return { class: "execute", reason: "default" };
   }
@@ -106,7 +133,7 @@ export class Router {
   route(body: Json, requested: Rung, header?: string): Decision {
     const ladder = this.cfg.families[requested.family].map((r) => ({ ...r, family: requested.family }));
     const at = (i: number) => ladder[Math.min(Math.max(i, 0), ladder.length - 1)];
-    const off = (reason: string): Decision => ({ rung: requested, class: null, classReason: reason, conversationKey: null, sticky: false, escalated: false, escalationReason: null });
+    const off = (reason: string): Decision => ({ rung: requested, undecided: false, class: null, classReason: reason, conversationKey: null, sticky: false, escalated: false, escalationReason: null });
     const classes = this.rc.classes[requested.family];
     if (!this.rc.enabled) return off("disabled");
     if (header === "off") return off("header:off");
@@ -114,9 +141,10 @@ export class Router {
 
     const reqIdx = ladder.findIndex((r) => r.alias === requested.alias);
     const start = (c: Class) => ladder.findIndex((r) => r.alias === classes[c]);
+    const hasTrivial = classes.trivial !== undefined;
     // Signal 1: a request below the execute floor is the client's explicit cheap choice (Claude Code's haiku subagents
-    // and titles): execute at that rung, never upgraded, not tracked.
-    if (reqIdx < start("execute")) return { ...off("client-model:pinned"), class: "execute" };
+    // and titles): execute at that rung, never upgraded, not tracked. `auto` aliases carry no such choice.
+    if (!requested.auto && reqIdx < start("execute")) return { ...off("client-model:pinned"), class: "execute" };
 
     const s = promptShape(body);
     const key = sha(s.userId + "\0" + s.system + "\0" + s.firstUser).slice(0, 16);
@@ -127,15 +155,27 @@ export class Router {
     let escalated = false;
     let classReason: string;
 
+    // A trivial entry that was never escalated is re-classified every turn: stickiness exists to protect prompt caching,
+    // and a trivial request has nothing worth caching. Once the conversation grows it gets a normal, sticky class.
+    if (entry && entry.class === "trivial" && entry.rung === start("trivial") && this.classify(body, s, hasTrivial).class !== "trivial") entry = undefined;
     if (entry) {
       classReason = "sticky";
       // Signal: identical prompt re-sent within the retry window = the client gave up on the last answer.
       if (entry.lastPrompt === prompt && now - entry.lastSeen <= this.rc.retryWindowMs) {
         escalationReason = "retry";
         escalated = this.bump(entry, ladder.length);
+      } else if (this.rc.upgradeOnIntent && isUserTurn(body)) {
+        // Upgrade on intent: a new user turn that explicitly asks for exploration (explore keyword, thinking on) moves the
+        // conversation up to that class. Shape signals do not count, and nothing ever moves a conversation down.
+        const c = this.classify(body, s, hasTrivial);
+        if (RANK[c.class] > RANK[entry.class] && (c.reason === "thinking" || c.reason === "keyword:explore")) {
+          entry.class = c.class;
+          entry.rung = Math.max(entry.rung, start(c.class));
+          classReason = `upgrade:${c.reason}`;
+        }
       }
     } else {
-      const c = this.classify(body, s);
+      const c = this.classify(body, s, hasTrivial);
       classReason = c.reason;
       entry = { class: c.class, rung: start(c.class), lastSeen: now, lastPrompt: "" };
     }
@@ -143,13 +183,40 @@ export class Router {
     this.touch(key, entry, now, prompt);
     let cls = entry.class;
     let idx = entry.rung;
-    if (header === "explore" || header === "execute") {
+    if (header === "explore" || header === "execute" || (header === "trivial" && hasTrivial)) {
       // Per-request override: forces the class for this request, leaves the sticky entry alone.
       cls = header;
       idx = start(header);
       classReason = `header:${header}`;
     }
-    return { rung: at(this.floor(idx, reqIdx)), class: cls, classReason, conversationKey: key, sticky, escalated, escalationReason };
+    // The client's model is a floor for execute/explore. A trivial verdict is the one case that goes below it: the
+    // request has been judged too small to need the model the client named (`trivialBelowFloor`, default true).
+    const floored = requested.auto || (cls === "trivial" && this.rc.trivialBelowFloor) ? idx : this.floor(idx, reqIdx);
+    // "Undecided" = the rules fell through to keyword/default/trivial-shape on a fresh classification; that is when a model
+    // classifier adds information. Thinking and shape signals are considered decisive, as is anything sticky or forced.
+    const soft = /^(default|keyword:.*|shape:trivial)$/.test(classReason);
+    const undecided = soft && (this.rc.classifier.mode === "always" || classReason === "default");
+    return { rung: at(floored), undecided, class: cls, classReason, conversationKey: key, sticky, escalated, escalationReason };
+  }
+
+  /**
+   * Apply a model classifier's verdict to a decision route() just made (same request). Replaces the conversation's class
+   * and starting rung, keeps any escalation, and re-derives the rung with the same floor rules.
+   */
+  reclassify(d: Decision, requested: Rung, verdict: Class, reason: string): Decision {
+    const classes = this.rc.classes[requested.family];
+    if (!d.conversationKey || !classes) return d;
+    const entry = this.conv.get(d.conversationKey);
+    if (!entry) return d;
+    const ladder = this.cfg.families[requested.family].map((r) => ({ ...r, family: requested.family }));
+    const cls: Class = verdict === "trivial" && classes.trivial === undefined ? "execute" : verdict;
+    const startIdx = ladder.findIndex((r) => r.alias === classes[cls]);
+    const bumped = entry.rung - ladder.findIndex((r) => r.alias === classes[entry.class]); // escalations already applied
+    entry.class = cls;
+    entry.rung = Math.min(startIdx + Math.max(bumped, 0), ladder.length - 1);
+    const reqIdx = ladder.findIndex((r) => r.alias === requested.alias);
+    const floored = requested.auto || (cls === "trivial" && this.rc.trivialBelowFloor) ? entry.rung : this.floor(entry.rung, reqIdx);
+    return { ...d, rung: ladder[Math.min(Math.max(floored, 0), ladder.length - 1)], class: cls, classReason: reason, undecided: false };
   }
 
   /** Feed the response back; bumps the conversation one rung on an observable failure. Returns the reason if one fired. */

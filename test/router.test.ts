@@ -70,7 +70,7 @@ test("route: client model is a floor, strongest is honoured, cheap rung is pinne
 
 test("route: disabled, missing classes and header bypass", () => {
   const off = new Router({ ...cfg, routing: { ...cfg.routing, enabled: false } });
-  assert.deepEqual(off.route(msg("design it"), rung("sonnet")), { rung: rung("sonnet"), class: null, classReason: "disabled", conversationKey: null, sticky: false, escalated: false, escalationReason: null });
+  assert.deepEqual(off.route(msg("design it"), rung("sonnet")), { rung: rung("sonnet"), undecided: false, class: null, classReason: "disabled", conversationKey: null, sticky: false, escalated: false, escalationReason: null });
   assert.equal(new Router({ families: cfg.families }).route(msg("design it"), rung("sonnet")).classReason, "disabled");
   const partial = new Router({ ...cfg, routing: { ...cfg.routing, classes: { anthropic: cfg.routing!.classes!.anthropic } } });
   assert.equal(partial.route(msg("design it"), rung("gpt-oss-20b")).classReason, "no-classes");
@@ -154,4 +154,89 @@ test("ToolJsonCheck: assembled fragments must parse", () => {
   const bad = new ToolJsonCheck();
   bad.add(1, '{"a":'); // truncated
   assert.equal(bad.malformed(), true);
+});
+
+test("trivial: opening short ask goes to the trivial rung below the client's floor; grows into a sticky class; header and opt-outs", () => {
+  const tcfg: Config = { ...cfg, routing: { ...cfg.routing!, classes: { ...cfg.routing!.classes, anthropic: { trivial: "haiku", execute: "sonnet", explore: "opus" } } } };
+  const r = new Router(tcfg);
+  // short opening ask, no tools: trivial, and it drops below the requested sonnet
+  let d = r.route(msg("what does HTTP 429 mean?"), rung("claude-sonnet-5"));
+  assert.deepEqual([d.class, d.classReason, d.rung.alias, d.sticky], ["trivial", "shape:trivial", "haiku", false]);
+  // not trivial: tools attached, or an explore keyword, or a second turn, or a long ask
+  assert.equal(r.route({ ...msg("what does HTTP 429 mean?", "sys2"), tools: [{ name: "t" }] }, rung("claude-sonnet-5")).class, "execute");
+  assert.equal(r.route(msg("why does this design leak?", "sys3"), rung("claude-sonnet-5")).class, "explore");
+  assert.equal(r.route(msg("x".repeat(301), "sys4"), rung("claude-sonnet-5")).class, "execute");
+  // the same conversation growing past trivial is re-classified (not stuck on haiku) and then sticks
+  const grown = { model: "claude-sonnet-5", system: "sys", messages: [{ role: "user", content: "what does HTTP 429 mean?" }, { role: "assistant", content: "rate limited" }, { role: "user", content: "implement a retry with backoff for it" }] };
+  d = r.route(grown, rung("claude-sonnet-5"));
+  assert.deepEqual([d.class, d.classReason, d.rung.alias, d.sticky], ["execute", "keyword:execute", "sonnet", false]);
+  assert.deepEqual([r.route(grown, rung("claude-sonnet-5")).classReason], ["sticky"]);
+  // an escalated trivial conversation keeps its rung
+  d = r.route(msg("hi", "sys5"), rung("claude-sonnet-5"));
+  assert.equal(d.rung.alias, "haiku");
+  assert.deepEqual(r.observe(d, { outputTokens: 0 }), { escalated: true, reason: "empty" });
+  const next = { model: "claude-sonnet-5", system: "sys5", messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "hello" }, { role: "user", content: "ok" }] };
+  d = r.route(next, rung("claude-sonnet-5"));
+  assert.deepEqual([d.rung.alias, d.classReason], ["sonnet", "sticky"]);
+  // header forces trivial for one request; trivialBelowFloor:false keeps the client's model
+  assert.equal(r.route({ ...msg("implement the thing", "sys6"), tools: [{ name: "t" }] }, rung("claude-sonnet-5"), "trivial").rung.alias, "haiku");
+  const r2 = new Router({ ...tcfg, routing: { ...tcfg.routing!, trivialBelowFloor: false } });
+  d = r2.route(msg("what does HTTP 429 mean?"), rung("claude-sonnet-5"));
+  assert.deepEqual([d.class, d.rung.alias], ["trivial", "sonnet"]);
+  // families without a trivial rung never see the class; haiku requests stay pinned
+  assert.equal(r.route({ model: "gpt-oss-20b", messages: [{ role: "user", content: "hi" }] }, rung("gpt-oss-20b")).class, "execute");
+  assert.equal(r.route(msg("hi", "sys7"), rung("claude-haiku-4-5")).classReason, "client-model:pinned");
+});
+
+test("upgrade on intent: a later user turn with an explore signal moves a sticky conversation up, never down; tool results and shape signals do not", () => {
+  const r = new Router(cfg);
+  const first = { model: "claude-sonnet-5", system: "sys", messages: [{ role: "user", content: "implement the parser" }] };
+  assert.equal(r.route(first, rung("claude-sonnet-5")).rung.alias, "sonnet");
+  const turn = (last: any) => ({ ...first, messages: [...first.messages, { role: "assistant", content: "done" }, { role: "user", content: last }] });
+  // tool result carrying an explore word is not the user asking
+  assert.equal(r.route(turn([{ type: "tool_result", tool_use_id: "1", content: "why design" }]), rung("claude-sonnet-5")).rung.alias, "sonnet");
+  // plain follow-up without a signal stays put
+  let d = r.route(turn("now add a test"), rung("claude-sonnet-5"));
+  assert.deepEqual([d.classReason, d.rung.alias], ["sticky", "sonnet"]);
+  // explicit explore ask upgrades
+  d = r.route(turn("why does the design leak memory?"), rung("claude-sonnet-5"));
+  assert.deepEqual([d.class, d.classReason, d.rung.alias], ["explore", "upgrade:keyword:explore", "opus"]);
+  // and it sticks there; an execute ask afterwards does not bring it back down
+  d = r.route(turn("implement the fix"), rung("claude-sonnet-5"));
+  assert.deepEqual([d.class, d.classReason, d.rung.alias], ["explore", "sticky", "opus"]);
+  // opt out
+  const r2 = new Router({ ...cfg, routing: { ...cfg.routing!, upgradeOnIntent: false } });
+  r2.route(first, rung("claude-sonnet-5"));
+  assert.equal(r2.route(turn("why does the design leak memory?"), rung("claude-sonnet-5")).classReason, "sticky");
+});
+
+test("auto alias: no floor, no pinning, router owns the decision; undecided flag and reclassify", () => {
+  const acfg: Config = { ...cfg, aliases: { ...cfg.aliases, auto: "auto:anthropic", "auto-oss": "auto:openai" },
+    routing: { ...cfg.routing!, classes: { ...cfg.routing!.classes, anthropic: { trivial: "haiku", execute: "sonnet", explore: "opus" } }, classifier: { enabled: true, model: "haiku" } } };
+  const t = modelTable(acfg);
+  const auto = resolveModel(t, "auto")!;
+  assert.deepEqual([auto.alias, auto.family, auto.auto], ["sonnet", "anthropic", true]);
+  assert.deepEqual([resolveModel(t, "auto-oss")!.alias, resolveModel(t, "auto-oss")!.auto], ["gpt-oss-20b", true]);
+  const r = new Router(acfg);
+  // a short opening ask on auto lands on haiku (trivial), and is reported undecided only for soft signals
+  let d = r.route({ ...msg("what is a monad?", "s1"), model: "auto" }, auto);
+  assert.deepEqual([d.class, d.rung.alias, d.undecided], ["trivial", "haiku", false]); // fallback mode: only "default" is undecided
+  d = r.route({ ...msg("do the thing with the stuff", "s2"), model: "auto", tools: [{ name: "t" }] }, auto);
+  assert.deepEqual([d.class, d.classReason, d.rung.alias, d.undecided], ["execute", "default", "sonnet", true]);
+  // classifier says explore: conversation moves to opus and later turns stick there
+  const d2 = r.reclassify(d, auto, "explore", "classifier:explore");
+  assert.deepEqual([d2.class, d2.classReason, d2.rung.alias, d2.undecided], ["explore", "classifier:explore", "opus", false]);
+  const follow = { ...msg("do the thing with the stuff", "s2"), model: "auto", tools: [{ name: "t" }], messages: [{ role: "user", content: "do the thing with the stuff" }, { role: "assistant", content: "ok" }, { role: "user", content: "continue" }] };
+  assert.deepEqual([r.route(follow, auto).rung.alias, r.route(follow, auto).classReason], ["opus", "sticky"]);
+  // classifier says trivial in a family without a trivial rung -> execute
+  const oss = resolveModel(t, "auto-oss")!;
+  d = r.route({ model: "auto-oss", messages: [{ role: "user", content: "do the thing" }], tools: [{ name: "t" }] }, oss);
+  assert.equal(r.reclassify(d, oss, "trivial", "classifier:trivial").rung.alias, "gpt-oss-20b");
+  // "always" mode marks keyword decisions undecided too; thinking stays decisive
+  const r2 = new Router({ ...acfg, routing: { ...acfg.routing!, classifier: { enabled: true, model: "haiku", mode: "always" } } });
+  assert.equal(r2.route({ ...msg("implement it", "s3"), model: "auto", tools: [{ name: "t" }] }, auto).undecided, true);
+  assert.equal(r2.route({ ...msg("implement it", "s4"), model: "auto", thinking: { type: "enabled", budget_tokens: 1 } }, auto).undecided, false);
+  // an explicit haiku request is still pinned; auto is not
+  assert.equal(r.route(msg("hi", "s5"), rung("claude-haiku-4-5")).classReason, "client-model:pinned");
+  assert.throws(() => new Router({ ...acfg, routing: { ...acfg.routing!, classifier: { enabled: true } } }), /classifier\.model/);
 });

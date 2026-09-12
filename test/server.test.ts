@@ -115,3 +115,51 @@ test("router on OpenAI shape: stays in the openai family, throttling escalates",
     assert.deepEqual([log.family, log.routedModel, log.sticky], ["openai", "gpt-oss-120b", true]);
   });
 });
+
+test("log carries the counterfactual cost at the requested model", async () => {
+  const client = fakeClient(() => anthropicReply());
+  const tcfg: Config = { ...cfg, routing: { ...cfg.routing!, classes: { ...cfg.routing!.classes, anthropic: { trivial: "haiku", execute: "sonnet", explore: "opus" } } } };
+  await withServer(tcfg, client, async (post) => {
+    const r = await post("/v1/messages", req("what is 2+2?"));
+    assert.equal(r.status, 200);
+    assert.equal(client.sent[0].input.modelId, "h");
+    const [log] = await lastLog();
+    // 10 in + 5 out: haiku 1/5 per M -> 0.000035; sonnet 2/10 per M -> 0.00007
+    assert.deepEqual([log.class, log.requestedModel, log.routedModel], ["trivial", "sonnet", "haiku"]);
+    assert.ok(Math.abs(log.costUsd - 0.000035) < 1e-9 && Math.abs(log.requestedCostUsd - 0.00007) < 1e-9);
+  });
+});
+
+test("classifier model is consulted when the rules are undecided, its verdict routes the request, and its cost is logged", async () => {
+  const client = fakeClient((c) => (c.name === "ConverseCommand" && c.input.system?.[0]?.text?.includes("route requests")
+    ? { output: { message: { role: "assistant", content: [{ text: "explore: open-ended architecture question" }] } }, stopReason: "end_turn", usage: { inputTokens: 120, outputTokens: 8 } }
+    : anthropicReply()));
+  const ccfg: Config = { ...cfg, aliases: { auto: "auto:anthropic" }, routing: { ...cfg.routing!, classifier: { enabled: true, model: "haiku" } } };
+  await withServer(ccfg, client, async (post) => {
+    const r = await post("/v1/messages", { model: "auto", max_tokens: 100, system: "S", tools: [{ name: "t", input_schema: {} }], messages: [{ role: "user", content: "have a look at the thing" }] });
+    assert.equal(r.status, 200);
+    assert.deepEqual(client.sent.map((s) => s.name), ["ConverseCommand", "InvokeModelCommand"]);
+    assert.equal(client.sent[1].input.modelId, "o");
+    const [log] = await lastLog();
+    assert.deepEqual([log.class, log.classReason, log.requestedModel, log.routedModel, log.classifierNote], ["explore", "classifier:explore", "sonnet", "opus", "open-ended architecture question"]);
+    assert.ok(log.classifierMs >= 0 && log.classifierCostUsd > 0);
+    // second turn in the same conversation: sticky, classifier not called again
+    const r2 = await post("/v1/messages", { model: "auto", max_tokens: 100, system: "S", tools: [{ name: "t", input_schema: {} }], messages: [{ role: "user", content: "have a look at the thing" }, { role: "assistant", content: "hi" }, { role: "user", content: "and then?" }] });
+    assert.equal(r2.status, 200);
+    assert.equal(client.sent.length, 3);
+    const [log2] = await lastLog();
+    assert.deepEqual([log2.classReason, log2.routedModel, log2.classifierNote], ["sticky", "opus", null]);
+  });
+});
+
+test("classifier failure leaves the rules' decision in place", async () => {
+  const client = fakeClient((c) => { if (c.name === "ConverseCommand") throw Object.assign(new Error("boom"), { name: "ThrottlingException", $metadata: { httpStatusCode: 429 } }); return anthropicReply(); });
+  const ccfg: Config = { ...cfg, aliases: { auto: "auto:anthropic" }, routing: { ...cfg.routing!, classifier: { enabled: true, model: "haiku" } } };
+  await withServer(ccfg, client, async (post) => {
+    const r = await post("/v1/messages", { model: "auto", max_tokens: 100, system: "S", tools: [{ name: "t", input_schema: {} }], messages: [{ role: "user", content: "have a look at the thing" }] });
+    assert.equal(r.status, 200);
+    const [log] = await lastLog();
+    assert.deepEqual([log.classReason, log.routedModel], ["default", "sonnet"]);
+    assert.match(log.classifierNote, /ThrottlingException/);
+  });
+});

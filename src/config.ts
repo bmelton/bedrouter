@@ -9,12 +9,14 @@ export type Rung = {
   inputPerM: number;
   outputPerM: number;
   family: Family;
+  /** Set on `auto` aliases: the client is not choosing a model, only a family; the router owns the whole decision. */
+  auto?: boolean;
 };
 
 export type Config = {
   families: Record<Family, Omit<Rung, "family">[]>;
   aliases?: Record<string, string>;
-  routing?: Omit<Partial<RoutingConfig>, "shape" | "keywords"> & { shape?: Partial<RoutingConfig["shape"]>; keywords?: Partial<RoutingConfig["keywords"]> };
+  routing?: Omit<Partial<RoutingConfig>, "shape" | "keywords" | "classifier"> & { shape?: Partial<RoutingConfig["shape"]>; keywords?: Partial<RoutingConfig["keywords"]>; classifier?: Partial<RoutingConfig["classifier"]> };
 };
 
 export const DEFAULT_CONFIG_PATH = "./bedrouter.json";
@@ -35,6 +37,18 @@ export function modelTable(cfg: Config): Map<string, Rung> {
     for (const r of rungs) table.set(r.alias, { ...r, family });
   }
   for (const [name, target] of Object.entries(cfg.aliases ?? {})) {
+    // "auto:<family>" = no model preference; resolves to the family's execute rung (or the first rung) with the auto flag,
+    // which removes the client-model floor and the pinned-cheap rule for that request.
+    const auto = /^auto:(\w+)$/.exec(target);
+    if (auto) {
+      const family = auto[1] as Family;
+      const rungs = cfg.families[family];
+      if (!rungs?.length) throw new Error(`alias "${name}": unknown family "${family}"`);
+      const exec = cfg.routing?.classes?.[family]?.execute;
+      const base = rungs.find((r) => r.alias === exec) ?? rungs[0];
+      table.set(name, { ...base, family, auto: true });
+      continue;
+    }
     const rung = table.get(target);
     if (!rung) throw new Error(`alias "${name}" points at unknown rung "${target}"`);
     table.set(name, rung);

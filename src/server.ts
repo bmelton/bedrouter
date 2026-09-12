@@ -1,3 +1,4 @@
+import "./env.js"; // must run before anything reads process.env
 import http from "node:http";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -12,12 +13,20 @@ import {
 import { estimateCost, loadConfig, modelTable, resolveModel, type Config, type Rung, type Usage } from "./config.js";
 import { ClientError, converseEventToOpenai, converseToOpenai, newStreamState, openaiToConverse, toError } from "./translate.js";
 import { Router, ToolJsonCheck, type Class, type Decision } from "./router.js";
+import { describe, preflight } from "./preflight.js";
+import { classifyWithModel } from "./classifier.js";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Json = any;
 
 const region = process.env.AWS_REGION ?? "us-east-1";
 const LOG_PATH = process.env.BEDROUTER_LOG ?? "./bedrouter.log.jsonl";
+// Debug mode: a human-readable line on stdout when a request arrives, when it is routed, and when it finishes.
+const DEBUG = /^(1|true|yes|on)$/i.test(process.env.BEDROUTER_DEBUG ?? "") || process.argv.includes("--debug");
+const debug = (line: string) => { if (DEBUG) console.log(line); };
+const hhmmss = () => new Date().toISOString().slice(11, 19);
+const kTok = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+const usd = (n: number | null | undefined) => (n == null ? "-" : `$${n.toFixed(n < 0.01 ? 5 : 4)}`);
 
 // Decision-log line. Existing fields never change; the routing fields were appended by the router milestone.
 export type LogEntry = {
@@ -33,6 +42,7 @@ export type LogEntry = {
   cacheWriteTokens: number | null;
   latencyMs: number;
   costUsd: number | null;
+  requestedCostUsd: number | null; // what the same usage would have cost on the model the client asked for
   stopReason: string | null;
   error: string | null;
   class: Class | null;
@@ -43,13 +53,17 @@ export type LogEntry = {
   sticky: boolean;
   escalated: boolean;
   escalationReason: string | null;
+  classifierNote: string | null; // the classifier model's one-line reason, or its error; null when it did not run
+  classifierMs: number | null;
+  classifierCostUsd: number | null;
 };
 
 // Per-request routing state shared between the handler and the finally block.
-type RouteCtx = { decision?: Decision; tools: ToolJsonCheck };
+type RouteCtx = { decision?: Decision; requested?: Rung; tools: ToolJsonCheck };
 
 function appendLog(entry: LogEntry) {
-  fs.appendFile(LOG_PATH, JSON.stringify(entry) + "\n", (err) => err && console.error("bedrouter: log write failed:", err.message));
+  // sync on purpose: one small line per request, and the line must survive a process exit right after the response
+  try { fs.appendFileSync(LOG_PATH, JSON.stringify(entry) + "\n"); } catch (err) { console.error("bedrouter: log write failed:", (err as Error).message); }
 }
 
 class HttpError extends Error {
@@ -106,6 +120,8 @@ function checkAuth(req: http.IncomingMessage) {
 export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRuntimeClient, "send"> = new BedrockRuntimeClient({ region })): http.Server {
   const table = modelTable(cfg);
   const router = new Router(cfg);
+  const classifierRung = router.rc.classifier.enabled ? table.get(router.rc.classifier.model!) : undefined;
+  if (router.rc.classifier.enabled && !classifierRung) throw new Error(`routing.classifier.model "${router.rc.classifier.model}" is not a known model`);
   const aliases = () => [...table.keys()];
 
   const resolve = (name: unknown): Rung => {
@@ -114,22 +130,38 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     return rung;
   };
 
-  /** Resolve the client's model, then let the router pick the rung within that family. */
-  const route = (req: http.IncomingMessage, body: Json, log: LogEntry, rt: RouteCtx): Rung => {
+  /** Resolve the client's model, let the rules pick the rung within that family, and consult the classifier model when they were undecided. */
+  const route = async (req: http.IncomingMessage, body: Json, log: LogEntry, rt: RouteCtx): Promise<Rung> => {
     const requested = resolve(body.model);
     const header = req.headers["x-bedrouter-class"];
-    if (header !== undefined && !/^(execute|explore|off)$/.test(String(header))) throw new HttpError(400, `x-bedrouter-class must be execute, explore or off`);
-    const d = (rt.decision = router.route(body, requested, header as string | undefined));
+    if (header !== undefined && !/^(trivial|execute|explore|off)$/.test(String(header))) throw new HttpError(400, `x-bedrouter-class must be trivial, execute, explore or off`);
+    rt.requested = requested;
+    let d = (rt.decision = router.route(body, requested, header as string | undefined));
+    if (d.undecided && classifierRung) {
+      const v = await classifyWithModel(client, classifierRung, body, router.rc.classifier);
+      log.classifierNote = v.note;
+      log.classifierMs = v.ms;
+      log.classifierCostUsd = v.costUsd;
+      if (v.class) d = rt.decision = router.reclassify(d, requested, v.class, `classifier:${v.class}`);
+      // on error/unparseable the rules' decision stands; the note in the log says why
+    }
     Object.assign(log, {
       clientModel: body.model, bedrockId: d.rung.bedrockId, family: d.rung.family, stream: !!body.stream,
       class: d.class, classReason: d.classReason, conversationKey: d.conversationKey, requestedModel: requested.alias, routedModel: d.rung.alias, sticky: d.sticky,
     });
+    if (DEBUG) {
+      const via = d.class ? `[${d.class} · ${d.classReason}]` : `[${d.classReason}]`;
+      const note = log.classifierNote != null ? `  classifier: "${log.classifierNote}" ${log.classifierMs} ms ${usd(log.classifierCostUsd)}` : "";
+      const arrow = d.rung.alias === requested.alias ? "=" : "≠";
+      debug(`  routed  ${requested.alias}${requested.auto ? " (auto)" : ""} ${arrow}> ${d.rung.alias}  ${via}${d.escalationReason ? `  escalation:${d.escalationReason}` : ""}  conv=${d.conversationKey ?? "-"}${note}`);
+      debug(`          ${d.rung.bedrockId}`);
+    }
     return d.rung;
   };
 
   // --- POST /v1/messages: Anthropic Messages shape, native passthrough via InvokeModel -------------
   async function handleMessages(req: http.IncomingMessage, res: http.ServerResponse, body: Json, log: LogEntry, ac: AbortController, rt: RouteCtx) {
-    const rung = route(req, body, log, rt);
+    const rung = await route(req, body, log, rt);
     if (rung.family !== "anthropic") {
       // ponytail: Anthropic-shape -> non-Anthropic model needs an Anthropic->Converse translator; add one when a
       // Claude Code user actually wants gpt-oss. Until then this is a clear 400, never a silent re-route.
@@ -154,7 +186,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       const msg = JSON.parse(Buffer.from(out.body).toString("utf8"));
       takeUsage(msg.usage);
       log.stopReason = msg.stop_reason ?? null;
-      finishUsage(log, rung, usage);
+      finishUsage(log, rung, usage, rt);
       return sendJson(res, 200, msg);
     }
 
@@ -173,13 +205,13 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       if (event.type === "content_block_delta" && event.delta?.type === "input_json_delta") rt.tools.add(event.index, event.delta.partial_json ?? "");
       res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
     }
-    finishUsage(log, rung, usage);
+    finishUsage(log, rung, usage, rt);
     res.end();
   }
 
   // --- POST /v1/chat/completions: OpenAI shape, translated to Converse (any family) -----------------
   async function handleChat(req: http.IncomingMessage, res: http.ServerResponse, body: Json, log: LogEntry, ac: AbortController, rt: RouteCtx) {
-    const rung = route(req, body, log, rt);
+    const rung = await route(req, body, log, rt);
     const input = openaiToConverse(body, rung.bedrockId);
     const id = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     const usageOf = (u: Json): Usage => ({ input: u?.inputTokens ?? 0, output: u?.outputTokens ?? 0, cacheRead: u?.cacheReadInputTokens, cacheWrite: u?.cacheWriteInputTokens });
@@ -187,7 +219,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     if (!body.stream) {
       const out = await client.send(new ConverseCommand(input), { abortSignal: ac.signal });
       log.stopReason = out.stopReason ?? null;
-      finishUsage(log, rung, usageOf(out.usage));
+      finishUsage(log, rung, usageOf(out.usage), rt);
       return sendJson(res, 200, converseToOpenai(out, body.model, id));
     }
 
@@ -199,17 +231,20 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       for (const chunk of converseEventToOpenai(st, ev)) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     }
     log.stopReason = st.stopReason ?? null;
-    finishUsage(log, rung, usageOf(st.usage));
+    finishUsage(log, rung, usageOf(st.usage), rt);
     res.write("data: [DONE]\n\n");
     res.end();
   }
 
-  function finishUsage(log: LogEntry, rung: Rung, u: Usage) {
+  function finishUsage(log: LogEntry, rung: Rung, u: Usage, rt: RouteCtx) {
     log.inputTokens = u.input;
     log.outputTokens = u.output;
     log.cacheReadTokens = u.cacheRead ?? null;
     log.cacheWriteTokens = u.cacheWrite ?? null;
     log.costUsd = estimateCost(rung, u);
+    // Counterfactual: same tokens priced at the requested rung. Output length would differ on another model, so this is
+    // an estimate of what routing saved (or spent), not an invoice; the report sums it.
+    log.requestedCostUsd = rt.requested ? estimateCost(rt.requested, u) : null;
   }
 
   return http.createServer(async (req, res) => {
@@ -226,8 +261,9 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     const started = Date.now();
     const log: LogEntry = {
       ts: new Date().toISOString(), endpoint: url.pathname, clientModel: null, bedrockId: null, family: null, stream: false,
-      inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null, latencyMs: 0, costUsd: null, stopReason: null, error: null,
+      inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null, latencyMs: 0, costUsd: null, requestedCostUsd: null, stopReason: null, error: null,
       class: null, classReason: null, conversationKey: null, requestedModel: null, routedModel: null, sticky: false, escalated: false, escalationReason: null,
+      classifierNote: null, classifierMs: null, classifierCostUsd: null,
     };
     const ac = new AbortController();
     res.on("close", () => ac.abort());
@@ -236,6 +272,11 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     try {
       checkAuth(req);
       const body = await readJson(req);
+      if (DEBUG) {
+        const msgs = Array.isArray(body.messages) ? body.messages.length : 0;
+        const tools = Array.isArray(body.tools) ? body.tools.length : 0;
+        debug(`\n→ ${hhmmss()} ${url.pathname}  model=${body.model}  ${msgs} msg${msgs === 1 ? "" : "s"}  ${tools} tool${tools === 1 ? "" : "s"}  ~${kTok(Math.ceil(JSON.stringify(body).length / 4))} tok${body.stream ? "  stream" : ""}${req.headers["x-bedrouter-class"] ? `  x-bedrouter-class=${req.headers["x-bedrouter-class"]}` : ""}`);
+      }
       await handler(req, res, body, log, ac, rt);
     } catch (err: Json) {
       failed = err;
@@ -257,11 +298,19 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
         log.escalationReason = [d.escalationReason, obs.reason].filter(Boolean).join("+") || null;
       }
       appendLog(log);
+      if (DEBUG) {
+        if (log.error) debug(`  ✗ ${log.latencyMs} ms  ${log.error}${log.escalationReason ? `  → escalation:${log.escalationReason}${log.escalated ? " (moved up)" : " (at ceiling)"}` : ""}`);
+        else debug(`  ← ${log.stopReason ?? "?"}  in ${kTok(log.inputTokens ?? 0)}${log.cacheReadTokens ? ` (+${kTok(log.cacheReadTokens)} cached)` : ""}  out ${kTok(log.outputTokens ?? 0)}  ${log.latencyMs} ms  ${usd(log.costUsd)}${log.requestedCostUsd != null && log.requestedCostUsd !== log.costUsd ? ` (asked-for model: ${usd(log.requestedCostUsd)})` : ""}${log.escalationReason ? `  → escalation:${log.escalationReason}${log.escalated ? " (next request moves up)" : " (already at ceiling)"}` : ""}`);
+      }
     }
   });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const port = Number(process.env.PORT ?? 20129);
-  createServer().listen(port, "127.0.0.1", () => console.log(`bedrouter listening on http://127.0.0.1:${port} (region ${region})`));
+  const client = new BedrockRuntimeClient({ region });
+  const p = await preflight(client);
+  console.log(describe(p, region));
+  if (!p.ok && !process.env.BEDROUTER_SKIP_PREFLIGHT) process.exit(1);
+  createServer(loadConfig(), client).listen(port, "127.0.0.1", () => console.log(`bedrouter listening on http://127.0.0.1:${port}${DEBUG ? "  (debug: printing every request)" : "  (BEDROUTER_DEBUG=1 or --debug to print requests)"}`));
 }
