@@ -3,7 +3,12 @@
 bedrouter is a local, cost-aware model router for AWS Bedrock. OpenAI-compatible
 clients send requests to one `auto` model; bedrouter classifies each request,
 filters models by required capabilities, and chooses from one explicitly ordered
-stack. Pinned Anthropic models can also use the native Messages endpoint.
+stack. Decisions follow the conversation rather than the single request: a class
+is decided once and revisited on each human turn, a small classifier model breaks
+ties the rules cannot, and a failing or unreachable rung moves later requests
+along the stack. Every request records what it cost and what the client's own
+model would have cost, so `bedrouter report` prints the difference. Pinned
+Anthropic models can also use the native Messages endpoint.
 
 ## Install and run
 
@@ -56,16 +61,25 @@ classes it serves and the request features it supports:
   ],
   "routing": {
     "enabled": true,
-    "honorClientModel": false,
+    "honorClientModel": true,
+    "trivialBelowFloor": true,
+    "upgradeOnIntent": true,
     "cacheHitRate": 0.8,
+    "retryWindowMs": 60000,
+    "maxConversations": 1000,
     "classifier": {
       "enabled": true,
       "model": "nova-micro",
-      "mode": "fallback"
+      "mode": "fallback",
+      "maxChars": 4000,
+      "timeoutMs": 4000
     }
   }
 }
 ```
+
+`bedrouter.example.json` is the reference for every default, including the
+`routing.shape` thresholds and the `routing.keywords` lists.
 
 Rungs are selected cheapest-first by *effective* input price, which is the list
 price adjusted for prompt caching at the configured `cacheHitRate`: a cache read
@@ -75,29 +89,11 @@ every turn, so this ordering, not the list price, is what a session actually
 costs. The configured order is the tiebreak. `bedrouter stack --explain` prints
 both figures.
 
-For a `trivial`, `execute`, or `explore`
-request, the router chooses the first eligible rung that serves the class and
-supports the request shape. Tools, images, streaming, structured output, output
-size, and context size filter the eligible set. A prompt cache point sent to a
+For a `trivial`, `execute`, or `explore` request, the router chooses the first
+eligible rung that serves the class and supports the request shape. Tools,
+images, streaming, structured output, output size, and context size filter the
+eligible set. A prompt cache point sent to a
 model without prompt caching is stripped and recorded as a degradation.
-
-Classification reads only what the human typed. A harness that speaks in the
-user's name, with a session digest, a watcher wake, or an agent nudge, is skipped:
-a user turn is treated as injected when it starts with one of
-`routing.injectedMarkers` (default `U+2063`, the invisible separator firstmate
-prefixes) or exceeds `routing.shape.humanTurnMaxChars`. Without this, a single
-word inside a 17KB digest sets the class for a whole session.
-
-Every human turn re-decides the class. Raising it needs a strong signal, so a
-conversation does not thrash upward, and `upgradeOnIntent` gates that. Lowering
-it needs none, and is recorded as `downgrade:<reason>`, because a class that
-sticks forever turns one bad guess into the price of every later request.
-
-Conversations stay on their current vendor while that vendor has an eligible
-rung. Retries, throttling, server failures, truncated output, empty output, and
-malformed tool JSON move the next request rightward through the eligible stack.
-A capability-related Bedrock `ValidationException` excludes the contradicted
-rung and retries the same request once.
 
 The stack may list rungs this account cannot invoke, so one config file is
 portable across accounts. An `AccessDeniedException`, or a `ValidationException`
@@ -131,6 +127,67 @@ bedrouter stack --explain
 This prints the configured order, effective input price at the configured cache
 hit rate, and the enabled rungs serving each class.
 
+## Classes and conversations
+
+Classification reads only what the human typed. A harness that speaks in the
+user's name, with a session digest, a watcher wake, or an agent nudge, is skipped:
+a user turn is treated as injected when it starts with one of
+`routing.injectedMarkers` (default `U+2063`, the invisible separator firstmate
+prefixes) or exceeds `routing.shape.humanTurnMaxChars`. Without this, a single
+word inside a 17KB digest sets the class for a whole session.
+
+Every human turn re-decides the class. Raising it needs a strong signal, so a
+conversation does not thrash upward, and `upgradeOnIntent` gates that. Lowering
+it needs none, and is recorded as `downgrade:<reason>`, because a class that
+sticks forever turns one bad guess into the price of every later request.
+
+### The classifier
+
+The rules answer most requests. When they fall through to `default`, a small
+model decides instead. `routing.classifier.mode` chooses when to ask:
+`fallback` asks only on `default`, `always` also re-asks on the soft verdicts
+(`keyword:*`, `shape:trivial`).
+
+The verdict is stored on the conversation, so the classifier costs one short
+call per conversation and not one per request. `maxChars` clips the excerpt it
+reads and `timeoutMs` bounds the call. A timeout, an API error, or a reply that
+does not parse keeps the rule verdict and records the reason in
+`classifierNote`.
+
+A `trivial` verdict on a request that carries tools becomes `execute`, and the
+reason gains `+tools-floor`. A turn that carries tools can be asked to call one,
+whatever the turn looks like: "hi" to an agentic harness runs its startup
+checks. Classifier spend is counted against savings in `bedrouter report`.
+
+### Conversations
+
+A conversation key is a short hash of the client user id, the system prompt, and
+the first human turn. A changed system prompt or a compaction therefore starts a
+new conversation, which is why clients that want one continuous view send
+`x-bedrouter-session`. The router keeps the most recent `maxConversations`
+entries.
+
+Selection prefers the rung the conversation already used, then any rung from the
+same vendor, then the cheapest eligible rung. Retries, throttling, server
+failures, truncated output, empty output, and malformed tool JSON move the next
+request rightward through the eligible stack. An identical prompt seen again
+within `retryWindowMs` reads as a client retry and moves rightward too. When no
+rung to the right serves the current class, the class rises one step instead,
+from `trivial` to `execute` to `explore`. A capability-related Bedrock
+`ValidationException` excludes the contradicted rung and retries the same
+request once.
+
+### Pinned models
+
+A client that names a rung instead of `auto` still meets the router, and
+`honorClientModel` decides how far it may disagree. A pinned rung that already
+sits below the cheapest rung serving `execute` turns routing off for that
+request, with the reason `client-model:pinned`: the client asked for something
+cheaper than the router would ever pick, so there is nothing to save. Above that
+floor, `honorClientModel: true` keeps the router from selecting anything cheaper
+than the pinned rung. The one exception is a `trivial` class with
+`trivialBelowFloor` set, where a cheaper rung is the whole point.
+
 ## Client API
 
 Use the OpenAI-compatible endpoint for `auto` and all cross-vendor routing:
@@ -149,22 +206,67 @@ Other endpoints:
 - `GET /health` reports process and routing status.
 - `GET /v1/models` returns `auto`, enabled aliases, prices, vendor, task
   classes, and capabilities.
-- `GET /v1/conversations` and `GET /v1/sessions` expose recent totals.
+- `GET /v1/conversations` and `GET /v1/conversations/:key` expose conversation
+  totals.
+- `GET /v1/sessions` and `GET /v1/sessions/:key` expose client session totals.
 
-Clients may send `x-bedrouter-class: trivial|execute|explore|off`. The
-`x-bedrouter-session` header associates requests with a client session.
-Responses include the selected model, class, reason, and conversation key.
+A conversation is what the router derived. A session is whatever the client put
+in `x-bedrouter-session`, so it survives system prompt changes, compaction, and
+sub-agent calls, and it also counts the requests the router never tracked, such
+as pinned rungs and errors. Session totals are seeded from the decision log at
+startup, so a restart does not zero a running session.
 
-## Logs and reports
+Clients may send `x-bedrouter-class: trivial|execute|explore|off` to force or
+disable a class.
 
-Every request appends JSON to `BEDROUTER_LOG` (default
-`./bedrouter.log.jsonl`). Along with tokens, cost, latency, and outcome, each
-line records `vendor`, `eligibleCount`, `skipped[]`, and `degraded[]`.
+Every response carries the decision, which UI integrations read live. These
+header names are a stable interface:
+
+| Header | Value |
+| --- | --- |
+| `x-bedrouter-model` | the alias that answered |
+| `x-bedrouter-requested` | the model the client asked for |
+| `x-bedrouter-bedrock-id` | the Bedrock model identifier invoked |
+| `x-bedrouter-class` | `trivial`, `execute`, or `explore` |
+| `x-bedrouter-reason` | why that class, such as `sticky` or `keyword:explore` |
+| `x-bedrouter-conversation` | the conversation key |
+| `x-bedrouter-classifier` | the classifier's one-line reason, when it ran |
+
+## What routing costs and saves
+
+Every priced request records two figures: what it cost on the rung that answered,
+and `requestedCostUsd`, what the same token usage would have cost on the model
+the client asked for. The difference is the saving, and `bedrouter report` totals
+it, subtracts classifier spend, and breaks it down by class, by requested and
+routed model pair, and by deciding signal:
+
+```
+bedrouter report  ./bedrouter.log.jsonl
+  requests 680 (656 reached a model, 24 errors), conversations 55
+  tokens   in 19074379  out 185081  cache-read 0
+  cost     $3.5092 actual vs $1.4656 if every request had run on the model the client asked for
+  classifier 12 calls, $0.0039, avg 738 ms (counted against savings)
+  saved    $-2.0475 (-139.7%)  <- routing spent more than requested (escalations / explore upgrades)
+```
+
+A negative saving is a real result, not a bug, and the report labels it. It means
+the router spent more than the client's own model would have, because an
+escalation or an `explore` upgrade moved traffic to a stronger rung. Read it with
+the `By deciding signal` table, which names the signal that made those calls, and
+with the escalation triggers at the end of the report.
 
 ```sh
-bedrouter report
-bedrouter report --json
+bedrouter report --since 2026-09-13T00:00:00Z --session <key> --log ./other.jsonl --json
 ```
+
+## Logs
+
+Every request appends one JSON line to `BEDROUTER_LOG` (default
+`./bedrouter.log.jsonl`). Along with tokens, cost, latency, and outcome, each
+line records `vendor`, `eligibleCount`, `skipped[]`, `degraded[]`,
+`requestedCostUsd`, `class`, `classReason`, `sticky`, `escalated`,
+`escalationReason`, `conversationKey`, `sessionKey`, and, when the classifier
+ran, `classifierNote`, `classifierMs`, and `classifierCostUsd`.
 
 ## Development
 
