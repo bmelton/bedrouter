@@ -4,6 +4,7 @@
 //   bedrouter doctor [--probe]      credential source, config, optional 1-token probe of every rung
 //   bedrouter report [--since t] [--session key] [--log p] [--json]
 //   bedrouter smoke                 one streaming request per endpoint against real Bedrock
+//   bedrouter stack --explain       effective input prices and eligible rungs per class
 import "./env.js";
 
 const [cmd, ...rest] = process.argv.slice(2).filter((a) => a !== "--debug");
@@ -13,6 +14,7 @@ switch (cmd && !cmd.startsWith("-") ? cmd : "serve") {
   case "doctor": process.exit(await (await import("./doctor.js")).main(argv));
   case "report": process.exit(await (await import("./report.js")).main(argv));
   case "smoke": process.exit(await (await import("./smoke.js")).main(argv));
+  case "stack": process.exit(await (await import("./stack.js")).main(argv));
   case "serve": {
     const { BedrockRuntimeClient } = await import("@aws-sdk/client-bedrock-runtime");
     const { loadConfig } = await import("./config.js");
@@ -28,6 +30,6 @@ switch (cmd && !cmd.startsWith("-") ? cmd : "serve") {
     break;
   }
   default:
-    console.error(`unknown command "${cmd}". Usage: bedrouter [serve|doctor|report|smoke] [options]`);
+    console.error(`unknown command "${cmd}". Usage: bedrouter [serve|doctor|report|smoke|stack --explain] [options]`);
     process.exit(2);
 }

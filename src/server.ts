@@ -34,7 +34,10 @@ export type LogEntry = {
   endpoint: string;
   clientModel: string | null;
   bedrockId: string | null;
-  family: string | null;
+  vendor: string | null;
+  eligibleCount: number | null;
+  skipped: string[];
+  degraded: string[];
   stream: boolean;
   inputTokens: number | null;
   outputTokens: number | null;
@@ -81,7 +84,7 @@ export const sessionKeyOf = (h: string | string[] | undefined): string | null =>
 };
 
 // Per-request routing state shared between the handler and the finally block.
-type RouteCtx = { decision?: Decision; requested?: Rung; tools: ToolJsonCheck };
+type RouteCtx = { decision?: Decision; requested?: Rung; body?: Json; tools: ToolJsonCheck };
 
 function appendLog(entry: LogEntry) {
   // sync on purpose: one small line per request, and the line must survive a process exit right after the response
@@ -152,6 +155,14 @@ function checkAuth(req: http.IncomingMessage) {
   if (got !== want) throw new HttpError(401, "invalid api key");
 }
 
+export function stripCachePoints(value: Json): Json {
+  if (Array.isArray(value)) return value.filter((item) => !(item && typeof item === "object" && Object.hasOwn(item, "cachePoint"))).map(stripCachePoints);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "cachePoint").map(([key, child]) => [key, stripCachePoints(child)]));
+}
+
+const capabilityValidation = (err: Json) => err?.name === "ValidationException" && /unsupported|not support|cache|tool|image|schema|stream|max.?token|context/i.test(err?.message ?? "");
+
 export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRuntimeClient, "send"> = new BedrockRuntimeClient({ region })): http.Server {
   const table = modelTable(cfg);
   const router = new Router(cfg);
@@ -205,9 +216,9 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
   };
 
   /** Resolve the client's model, let the rules pick the rung within that family, and consult the classifier model when they were undecided. */
-  const route = async (req: http.IncomingMessage, body: Json, log: LogEntry, rt: RouteCtx): Promise<Rung> => {
+  const route = async (req: http.IncomingMessage, body: Json, log: LogEntry, rt: RouteCtx, forcedHeader?: string): Promise<Rung> => {
     const requested = resolve(body.model);
-    const header = req.headers["x-bedrouter-class"];
+    const header = forcedHeader ?? req.headers["x-bedrouter-class"];
     if (header !== undefined && !/^(trivial|execute|explore|off)$/.test(String(header))) throw new HttpError(400, `x-bedrouter-class must be trivial, execute, explore or off`);
     rt.requested = requested;
     let d = (rt.decision = router.route(body, requested, header as string | undefined));
@@ -216,12 +227,13 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       log.classifierNote = v.note;
       log.classifierMs = v.ms;
       log.classifierCostUsd = v.costUsd;
-      if (v.class) d = rt.decision = router.reclassify(d, requested, v.class, `classifier:${v.class}`);
+      if (v.class) d = rt.decision = router.reclassify(d, requested, v.class, `classifier:${v.class}`, body);
       // on error/unparseable the rules' decision stands; the note in the log says why
     }
     Object.assign(log, {
-      clientModel: body.model, bedrockId: d.rung.bedrockId, family: d.rung.family, stream: !!body.stream,
+      clientModel: body.model, bedrockId: d.rung.bedrockId, vendor: d.rung.vendor, stream: !!body.stream,
       class: d.class, classReason: d.classReason, conversationKey: d.conversationKey, requestedModel: requested.alias, routedModel: d.rung.alias, sticky: d.sticky,
+      eligibleCount: d.eligibleCount, skipped: d.skipped, degraded: d.degraded,
     });
     if (DEBUG) {
       const via = d.class ? `[${d.class} · ${d.classReason}]` : `[${d.classReason}]`;
@@ -235,11 +247,11 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
 
   // --- POST /v1/messages: Anthropic Messages shape, native passthrough via InvokeModel -------------
   async function handleMessages(req: http.IncomingMessage, res: http.ServerResponse, body: Json, log: LogEntry, ac: AbortController, rt: RouteCtx) {
-    const rung = await route(req, body, log, rt);
-    if (rung.family !== "anthropic") {
+    const rung = await route(req, body, log, rt, "off");
+    if (rt.requested?.auto || rung.vendor !== "anthropic") {
       // ponytail: Anthropic-shape -> non-Anthropic model needs an Anthropic->Converse translator; add one when a
       // Claude Code user actually wants gpt-oss. Until then this is a clear 400, never a silent re-route.
-      throw new HttpError(400, `model "${body.model}" is in the ${rung.family} family; only /v1/chat/completions can reach it`);
+      throw new HttpError(400, `model "${body.model}" can route across vendors; use /v1/chat/completions (only pinned Anthropic rungs use /v1/messages)`);
     }
     const { model: _m, stream, ...payload } = body;
     payload.anthropic_version ??= "bedrock-2023-05-31";
@@ -286,21 +298,42 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
 
   // --- POST /v1/chat/completions: OpenAI shape, translated to Converse (any family) -----------------
   async function handleChat(req: http.IncomingMessage, res: http.ServerResponse, body: Json, log: LogEntry, ac: AbortController, rt: RouteCtx) {
-    const rung = await route(req, body, log, rt);
-    const input = openaiToConverse(body, rung.bedrockId);
+    let rung = await route(req, body, log, rt);
+    let routedBody = rt.decision?.degraded.length ? stripCachePoints(body) : body;
+    let input = openaiToConverse(routedBody, rung.bedrockId);
     const names = toolNameMap(body);
     const id = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     const usageOf = (u: Json): Usage => ({ input: u?.inputTokens ?? 0, output: u?.outputTokens ?? 0, cacheRead: u?.cacheReadInputTokens, cacheWrite: u?.cacheWriteInputTokens });
 
     if (!body.stream) {
-      const out = await client.send(new ConverseCommand(input), { abortSignal: ac.signal });
+      let out;
+      try { out = await client.send(new ConverseCommand(input), { abortSignal: ac.signal }); }
+      catch (err) {
+        if (!capabilityValidation(err) || !rt.decision || !router.invalidate(rt.decision, body)) throw err;
+        const contradicted = rung.alias;
+        rung = await route(req, body, log, rt);
+        log.skipped.push(`${contradicted}:validation-contradiction`);
+        routedBody = rt.decision?.degraded.length ? stripCachePoints(body) : body;
+        input = openaiToConverse(routedBody, rung.bedrockId);
+        out = await client.send(new ConverseCommand(input), { abortSignal: ac.signal });
+      }
       log.stopReason = out.stopReason ?? null;
       finishUsage(log, rung, usageOf(out.usage), rt);
       for (const [k, v] of Object.entries(decisionHeaders(log))) res.setHeader(k, v);
       return sendJson(res, 200, converseToOpenai(out, body.model, id, names));
     }
 
-    const out = await client.send(new ConverseStreamCommand(input), { abortSignal: ac.signal });
+    let out;
+    try { out = await client.send(new ConverseStreamCommand(input), { abortSignal: ac.signal }); }
+    catch (err) {
+      if (!capabilityValidation(err) || !rt.decision || !router.invalidate(rt.decision, body)) throw err;
+      const contradicted = rung.alias;
+      rung = await route(req, body, log, rt);
+      log.skipped.push(`${contradicted}:validation-contradiction`);
+      routedBody = rt.decision?.degraded.length ? stripCachePoints(body) : body;
+      input = openaiToConverse(routedBody, rung.bedrockId);
+      out = await client.send(new ConverseStreamCommand(input), { abortSignal: ac.signal });
+    }
     startSse(res, decisionHeaders(log));
     const st = newStreamState(body.model, id, names);
     for await (const ev of out.stream ?? []) {
@@ -329,8 +362,8 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     const shape = url.pathname === "/v1/messages" ? "anthropic" : "openai";
     if (req.method === "GET" && url.pathname === "/health") return sendJson(res, 200, { ok: true, region, pid: process.pid, version: VERSION, routing: router.rc.enabled, classifier: router.rc.classifier.enabled ? router.rc.classifier.model : null, uptimeS: Math.round(process.uptime()) });
     if (req.method === "GET" && url.pathname === "/v1/models") {
-      const data = [...table.entries()].map(([id, r]) => ({ id, object: "model", created: 0, owned_by: r.family, bedrock_id: r.bedrockId,
-        bedrouter: { family: r.family, rung: r.alias, auto: !!r.auto, inputPerM: r.inputPerM, outputPerM: r.outputPerM } }));
+      const data = [...table.entries()].map(([id, r]) => ({ id, object: "model", created: 0, owned_by: r.vendor, bedrock_id: r.bedrockId,
+        bedrouter: { vendor: r.vendor, rung: r.alias, auto: !!r.auto, enabled: r.enabled, serves: r.serves, capabilities: r.capabilities, inputPerM: r.inputPerM, outputPerM: r.outputPerM } }));
       return sendJson(res, 200, { object: "list", data });
     }
     if (req.method === "GET" && url.pathname.startsWith("/v1/conversations/")) {
@@ -348,7 +381,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
 
     const started = Date.now();
     const log: LogEntry = {
-      ts: new Date().toISOString(), endpoint: url.pathname, clientModel: null, bedrockId: null, family: null, stream: false,
+      ts: new Date().toISOString(), endpoint: url.pathname, clientModel: null, bedrockId: null, vendor: null, eligibleCount: null, skipped: [], degraded: [], stream: false,
       inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null, latencyMs: 0, costUsd: null, requestedCostUsd: null, stopReason: null, error: null,
       class: null, classReason: null, conversationKey: null, requestedModel: null, routedModel: null, sticky: false, escalated: false, escalationReason: null,
       classifierNote: null, classifierMs: null, classifierCostUsd: null,
@@ -361,6 +394,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     try {
       checkAuth(req);
       const body = await readJson(req);
+      rt.body = body;
       if (DEBUG) {
         const msgs = Array.isArray(body.messages) ? body.messages.length : 0;
         const tools = Array.isArray(body.tools) ? body.tools.length : 0;
@@ -382,7 +416,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       log.latencyMs = Date.now() - started;
       if (rt.decision) {
         const d = rt.decision;
-        const obs = router.observe(d, { stopReason: log.stopReason, outputTokens: log.outputTokens, errorStatus: failed ? errorStatus(failed) : null, aborted: ac.signal.aborted, malformedToolJson: rt.tools.malformed() });
+        const obs = router.observe(d, { stopReason: log.stopReason, outputTokens: log.outputTokens, errorStatus: failed ? errorStatus(failed) : null, aborted: ac.signal.aborted, malformedToolJson: rt.tools.malformed() }, rt.body);
         log.escalated = d.escalated || obs.escalated;
         log.escalationReason = [d.escalationReason, obs.reason].filter(Boolean).join("+") || null;
       }

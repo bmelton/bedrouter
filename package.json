@@ -1,6 +1,6 @@
 {
   "name": "bedrouter",
-  "version": "0.4.2",
+  "version": "0.6.0",
   "description": "Local OpenAI/Anthropic-compatible proxy in front of AWS Bedrock",
   "keywords": [
     "bedrock",

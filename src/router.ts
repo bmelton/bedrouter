@@ -1,263 +1,32 @@
-// Class-based router: picks the cheapest rung in the client's family that should complete the task, sticks to it per
-// conversation (prompt caching), escalates one rung on observable failure. Rules and a small map, no ML.
 import { createHash } from "node:crypto";
-import type { Config, Family, Rung } from "./config.js";
-
-/* eslint-disable @typescript-eslint/no-explicit-any */
+import type { Config, Rung } from "./config.js";
 type Json = any;
-
 export type Class = "trivial" | "execute" | "explore";
+export type RoutingConfig = { enabled:boolean; honorClientModel:boolean; trivialBelowFloor:boolean; upgradeOnIntent:boolean; classifier:{enabled:boolean;model:string|null;mode:"fallback"|"always";maxChars:number;timeoutMs:number}; maxConversations:number;retryWindowMs:number;cacheHitRate:number;shape:{exploreInputTokens:number;exploreTools:number;executeTurns:number;executeLastUserChars:number;trivialMaxChars:number;trivialMaxInputTokens:number};keywords:Record<"execute"|"explore",string[]> };
+export const ROUTING_DEFAULTS:RoutingConfig={enabled:false,honorClientModel:true,trivialBelowFloor:true,upgradeOnIntent:true,classifier:{enabled:false,model:null,mode:"fallback",maxChars:4000,timeoutMs:4000},maxConversations:1000,retryWindowMs:60000,cacheHitRate:.8,shape:{exploreInputTokens:60000,exploreTools:40,executeTurns:8,executeLastUserChars:200,trivialMaxChars:300,trivialMaxInputTokens:1500},keywords:{explore:[],execute:[]}};
+export type Decision={rung:Rung;undecided:boolean;class:Class|null;classReason:string;conversationKey:string|null;sticky:boolean;escalated:boolean;escalationReason:string|null;eligibleCount:number;skipped:string[];degraded:string[]};
+export type Outcome={stopReason?:string|null;outputTokens?:number|null;errorStatus?:number|null;aborted?:boolean;malformedToolJson?:boolean};
+type Entry={class:Class;alias:string;vendor:string;lastSeen:number;lastPrompt:string};
+const text=(c:Json):string=>typeof c==="string"?c:Array.isArray(c)?c.map(p=>p?.type==="text"?p.text??"":"").join(""):"";
+const strip=(s:string)=>s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g,"");
+export function promptShape(body:Json){const ms:Json[]=Array.isArray(body.messages)?body.messages:[];const sys=ms.filter(m=>m.role==="system"||m.role==="developer"),users=ms.filter(m=>m.role==="user");return{system:[text(body.system),...sys.map(m=>text(m.content))].join("\n"),firstUser:strip(text(users[0]?.content)),lastUser:strip(text(users.at(-1)?.content)).trim(),turns:ms.length,dialogTurns:ms.length-sys.length,tools:Array.isArray(body.tools)?body.tools.length:0,inputTokens:Math.ceil(JSON.stringify(body).length/4),thinking:body.thinking?.type==="enabled"||/^(high|xhigh|max)$/.test(String(body.reasoning_effort??"")),userId:body.metadata?.user_id??body.user??""}}
+const words=(xs:string[])=>xs.length?new RegExp(`\\b(${xs.map(x=>x.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")).join("|")})\\b`,"i"):/$^/;
+const hash=(s:string)=>createHash("sha256").update(s).digest("hex");
+const rank:Record<Class,number>={trivial:0,execute:1,explore:2};
+const userTurn=(body:Json)=>{const ms=Array.isArray(body.messages)?body.messages:[],m=ms.at(-1);return!!m&&m.role==="user"&&(typeof m.content==="string"||(Array.isArray(m.content)&&m.content.some((p:Json)=>p?.type==="text")&&!m.content.some((p:Json)=>p?.type==="tool_result")))};
+const contains=(v:Json,key:string):boolean=>!!v&&typeof v==="object"&&(Object.hasOwn(v,key)||Object.values(v).some(x=>contains(x,key)));
 
-export type RoutingConfig = {
-  enabled: boolean;
-  honorClientModel: boolean;
-  trivialBelowFloor: boolean;
-  upgradeOnIntent: boolean;
-  classifier: { enabled: boolean; model: string | null; mode: "fallback" | "always"; maxChars: number; timeoutMs: number };
-  maxConversations: number;
-  retryWindowMs: number;
-  classes: Partial<Record<Family, Partial<Record<Class, string>> & Record<"execute" | "explore", string>>>;
-  shape: { exploreInputTokens: number; exploreTools: number; executeTurns: number; executeLastUserChars: number; trivialMaxChars: number; trivialMaxInputTokens: number };
-  keywords: Record<"execute" | "explore", string[]>;
-};
-
-export const ROUTING_DEFAULTS: RoutingConfig = {
-  enabled: false, // absent block = router off, so an existing bedrouter.json keeps today's behaviour
-  honorClientModel: true,
-  trivialBelowFloor: true,
-  upgradeOnIntent: true,
-  classifier: { enabled: false, model: null, mode: "fallback", maxChars: 4000, timeoutMs: 4000 },
-  maxConversations: 1000,
-  retryWindowMs: 60_000,
-  classes: {},
-  shape: { exploreInputTokens: 60_000, exploreTools: 40, executeTurns: 8, executeLastUserChars: 200, trivialMaxChars: 300, trivialMaxInputTokens: 1_500 },
-  keywords: { explore: [], execute: [] },
-};
-
-export type Decision = {
-  rung: Rung;
-  /** True when the rules did not find a decisive signal and a model classifier (if configured) should have a say. */
-  undecided: boolean;
-  class: Class | null;
-  classReason: string;
-  conversationKey: string | null; // null = not tracked (router off, bypass, or pinned cheap rung)
-  sticky: boolean;
-  escalated: boolean;
-  escalationReason: string | null;
-};
-
-/** What the server observed about a response; every field optional so callers pass what they have. */
-export type Outcome = { stopReason?: string | null; outputTokens?: number | null; errorStatus?: number | null; aborted?: boolean; malformedToolJson?: boolean };
-
-type Entry = { class: Class; rung: number; lastSeen: number; lastPrompt: string };
-
-const text = (content: Json): string =>
-  typeof content === "string" ? content : Array.isArray(content) ? content.map((p) => (p?.type === "text" ? p.text ?? "" : "")).join("") : "";
-
-// Claude Code injects <system-reminder> blocks (CLAUDE.md, git status, ...) into user turns; they are not the ask.
-const stripReminders = (s: string) => s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "");
-
-/** Cheap views of either request shape (Anthropic Messages or OpenAI chat). */
-export function promptShape(body: Json) {
-  const messages: Json[] = Array.isArray(body.messages) ? body.messages : [];
-  const systemMsgs = messages.filter((m) => m.role === "system" || m.role === "developer");
-  const system = [text(body.system), ...systemMsgs.map((m) => text(m.content))].join("\n");
-  const users = messages.filter((m) => m.role === "user");
-  return {
-    system,
-    firstUser: stripReminders(text(users[0]?.content)),
-    lastUser: stripReminders(text(users[users.length - 1]?.content)).trim(),
-    turns: messages.length,
-    // conversation turns excluding system/developer messages: 1 means "the opening ask, nothing has happened yet"
-    dialogTurns: messages.length - systemMsgs.length,
-    tools: Array.isArray(body.tools) ? body.tools.length : 0,
-    // ponytail: chars/4 token estimate over the whole body; use the model's tokenizer if thresholds need precision.
-    inputTokens: Math.ceil(JSON.stringify(body).length / 4),
-    thinking: body.thinking?.type === "enabled" || /^(high|xhigh|max)$/.test(String(body.reasoning_effort ?? "")),
-    userId: body.metadata?.user_id ?? body.user ?? "",
-  };
+export class Router{
+ readonly rc:RoutingConfig;private explore:RegExp;private execute:RegExp;private conv=new Map<string,Entry>();
+ constructor(private cfg:Config){const r=cfg.routing??{};this.rc={...ROUTING_DEFAULTS,...r,shape:{...ROUTING_DEFAULTS.shape,...r.shape},keywords:{...ROUTING_DEFAULTS.keywords,...r.keywords},classifier:{...ROUTING_DEFAULTS.classifier,...r.classifier}};if(this.rc.classifier.enabled&&!this.rc.classifier.model)throw new Error("routing.classifier.model is required when the classifier is enabled");this.explore=words(this.rc.keywords.explore);this.execute=words(this.rc.keywords.execute)}
+ classify(body:Json,s=promptShape(body),allowTrivial=this.cfg.stack.some(r=>r.enabled&&r.serves.includes("trivial"))){const x=this.rc.shape;if(s.thinking)return{class:"explore" as Class,reason:"thinking"};if(s.inputTokens>=x.exploreInputTokens)return{class:"explore" as Class,reason:"shape:long-context"};if(s.tools>=x.exploreTools)return{class:"explore" as Class,reason:"shape:many-tools"};if(s.turns>=x.executeTurns&&s.lastUser.length<=x.executeLastUserChars)return{class:"execute" as Class,reason:"shape:agentic-loop"};if(this.explore.test(s.lastUser))return{class:"explore" as Class,reason:"keyword:explore"};if(this.execute.test(s.lastUser))return{class:"execute" as Class,reason:"keyword:execute"};if(allowTrivial&&s.dialogTurns<=1&&!s.tools&&s.lastUser.length>0&&s.lastUser.length<=x.trivialMaxChars&&s.inputTokens<=x.trivialMaxInputTokens)return{class:"trivial" as Class,reason:"shape:trivial"};return{class:"execute" as Class,reason:"default"}}
+ eligible(body:Json,cls:Class,excluded=new Set<string>()){const s=promptShape(body),skipped:string[]=[],degraded:string[]=[];const image=contains(body.messages,"image")||JSON.stringify(body.messages??[]).includes('"image_url"'),schema=body.response_format?.type==="json_schema"||!!body.response_format?.json_schema,cache=contains(body,"cachePoint");const rungs=this.cfg.stack.filter(r=>{const why=!r.enabled?"disabled":excluded.has(r.alias)?"request-ineligible":!r.serves.includes(cls)?`does-not-serve:${cls}`:s.tools&&!r.capabilities.toolUse?"no-tool-use":image&&!r.capabilities.imageInput?"no-image-input":body.stream&&!r.capabilities.streaming?"no-streaming":schema&&!r.capabilities.structuredOutputs?"no-structured-outputs":Number(body.max_tokens??0)>r.capabilities.maxOutput?"max-output":s.inputTokens>r.capabilities.contextWindow?"context-window":"";if(why){skipped.push(`${r.alias}:${why}`);return false}if(cache&&!r.capabilities.promptCaching)degraded.push(`${r.alias}:strip-cachePoint`);return true});return{rungs,skipped,degraded}}
+ route(body:Json,requested:Rung,header?:string,excluded=new Set<string>()):Decision{const off=(reason:string):Decision=>({rung:requested,undecided:false,class:null,classReason:reason,conversationKey:null,sticky:false,escalated:false,escalationReason:null,eligibleCount:1,skipped:[],degraded:[]});if(!this.rc.enabled)return off("disabled");if(header==="off")return off("header:off");const s=promptShape(body),key=hash(s.userId+"\0"+s.system+"\0"+s.firstUser).slice(0,16),prompt=hash(JSON.stringify(body.messages??null)),now=Date.now();let entry=this.conv.get(key),reason="sticky",escalated=false,escalationReason:string|null=null;if(entry&&entry.class==="trivial"&&this.classify(body,s).class!=="trivial")entry=undefined;if(!entry){const c=this.classify(body,s);entry={class:c.class,alias:"",vendor:"",lastSeen:now,lastPrompt:""};reason=c.reason}else if(entry.lastPrompt===prompt&&now-entry.lastSeen<=this.rc.retryWindowMs){escalationReason="retry";escalated=this.bump(entry,body,excluded)}else if(this.rc.upgradeOnIntent&&userTurn(body)){const c=this.classify(body,s);if(rank[c.class]>rank[entry.class]&&/^(thinking|keyword:explore)$/.test(c.reason)){entry.class=c.class;reason=`upgrade:${c.reason}`}}
+ let cls=entry.class;if(header==="trivial"||header==="execute"||header==="explore"){cls=header;reason=`header:${header}`}const pool=this.eligible(body,cls,excluded),candidates=pool.rungs;if(!candidates.length)throw new Error(`no enabled rung is eligible for ${cls}: ${pool.skipped.join(", ")}`);let chosen=candidates.find(r=>r.alias===entry!.alias)??(entry.vendor?candidates.find(r=>r.vendor===entry!.vendor):undefined)??candidates[0];const reqAt=this.cfg.stack.findIndex(r=>r.alias===requested.alias),chosenAt=this.cfg.stack.findIndex(r=>r.alias===chosen.alias),executeAt=this.cfg.stack.findIndex(r=>r.enabled&&r.serves.includes("execute"));if(!requested.auto&&reqAt>=0&&reqAt<executeAt)return{...off("client-model:pinned"),class:"execute"};if(!requested.auto&&this.rc.honorClientModel&&!(cls==="trivial"&&this.rc.trivialBelowFloor)&&chosenAt<reqAt)chosen=candidates.find(r=>this.cfg.stack.indexOf(r)>=reqAt)??chosen;if(!reason.startsWith("header:")){entry.class=cls;entry.alias=chosen.alias;entry.vendor=chosen.vendor;this.touch(key,entry,now,prompt)}const soft=/^(default|keyword:.*|shape:trivial)$/.test(reason);return{rung:chosen,undecided:soft&&(this.rc.classifier.mode==="always"||reason==="default"),class:cls,classReason:reason,conversationKey:key,sticky:reason==="sticky",escalated,escalationReason,eligibleCount:candidates.length,skipped:pool.skipped,degraded:pool.degraded.filter(x=>x.startsWith(chosen.alias+":"))}}
+ reclassify(d:Decision,requested:Rung,verdict:Class,reason:string,body:Json={}):Decision{if(!d.conversationKey)return d;const e=this.conv.get(d.conversationKey);if(e){e.class=verdict;e.alias=""}const n=this.route(body,requested,verdict);return{...n,conversationKey:d.conversationKey,classReason:reason,undecided:false}}
+ observe(d:Decision,o:Outcome,body:Json={}){const none={escalated:false,reason:null as string|null};if(!d.conversationKey||o.aborted)return none;const e=this.conv.get(d.conversationKey);if(!e)return none;const reason=o.errorStatus===429||(o.errorStatus??0)>=500?`bedrock:${o.errorStatus}`:o.stopReason==="max_tokens"?"max_tokens":o.malformedToolJson?"malformed-tool-json":o.outputTokens===0?"empty":null;return reason?{escalated:this.bump(e,body,new Set()),reason}:none}
+ invalidate(d:Decision,body:Json){if(!d.conversationKey)return false;const e=this.conv.get(d.conversationKey);return e?this.bump(e,body,new Set([d.rung.alias])):false}
+ private bump(e:Entry,body:Json,excluded:Set<string>){const at=this.cfg.stack.findIndex(r=>r.alias===e.alias);let next=this.eligible(body,e.class,excluded).rungs.find(r=>this.cfg.stack.indexOf(r)>at);if(!next&&e.class!=="explore"){e.class=e.class==="trivial"?"execute":"explore";next=this.eligible(body,e.class,excluded).rungs.find(r=>this.cfg.stack.indexOf(r)>at)}if(!next)return false;e.alias=next.alias;e.vendor=next.vendor;return true}
+ private touch(k:string,e:Entry,n:number,p:string){e.lastSeen=n;e.lastPrompt=p;this.conv.delete(k);this.conv.set(k,e);if(this.conv.size>this.rc.maxConversations)this.conv.delete(this.conv.keys().next().value!)}
 }
-
-const wordRe = (words: string[]) =>
-  words.length ? new RegExp(`\\b(${words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\b`, "i") : /$^/;
-
-const sha = (s: string) => createHash("sha256").update(s).digest("hex");
-const RANK: Record<Class, number> = { trivial: 0, execute: 1, explore: 2 };
-
-/** True when the last message is the user typing (text), not a tool result the client is feeding back. */
-const isUserTurn = (body: Json): boolean => {
-  const messages: Json[] = Array.isArray(body.messages) ? body.messages : [];
-  const last = messages[messages.length - 1];
-  if (!last || last.role !== "user") return false;
-  if (typeof last.content === "string") return true;
-  return Array.isArray(last.content) && last.content.some((p: Json) => p?.type === "text") && !last.content.some((p: Json) => p?.type === "tool_result");
-};
-
-export class Router {
-  readonly rc: RoutingConfig;
-  private readonly explore: RegExp;
-  private readonly execute: RegExp;
-  private readonly conv = new Map<string, Entry>(); // ponytail: in-memory LRU capped by maxConversations; persist to disk if restarts matter
-
-  constructor(private readonly cfg: Config) {
-    const r = cfg.routing ?? {};
-    this.rc = { ...ROUTING_DEFAULTS, ...r, shape: { ...ROUTING_DEFAULTS.shape, ...r.shape }, keywords: { ...ROUTING_DEFAULTS.keywords, ...r.keywords }, classifier: { ...ROUTING_DEFAULTS.classifier, ...r.classifier } };
-    if (this.rc.classifier.enabled && !this.rc.classifier.model) throw new Error("routing.classifier.model is required when the classifier is enabled");
-    for (const [family, classes] of Object.entries(this.rc.classes) as [Family, Partial<Record<Class, string>>][]) {
-      for (const [cls, alias] of Object.entries(classes) as [Class, string][]) {
-        if (!cfg.families[family]?.some((x) => x.alias === alias)) throw new Error(`routing.classes.${family}.${cls}: "${alias}" is not a rung in that family`);
-      }
-    }
-    this.explore = wordRe(this.rc.keywords.explore);
-    this.execute = wordRe(this.rc.keywords.execute);
-  }
-
-  /**
-   * Signals 2-5 in order; the client-model signal (1) lives in route() because it needs the ladder.
-   * `trivial` is only considered when the family has a trivial rung (route() passes that in).
-   */
-  classify(body: Json, s = promptShape(body), allowTrivial = false): { class: Class; reason: string } {
-    const { shape } = this.rc;
-    if (s.thinking) return { class: "explore", reason: "thinking" };
-    if (s.inputTokens >= shape.exploreInputTokens) return { class: "explore", reason: "shape:long-context" };
-    if (s.tools >= shape.exploreTools) return { class: "explore", reason: "shape:many-tools" };
-    if (s.turns >= shape.executeTurns && s.lastUser.length <= shape.executeLastUserChars) return { class: "execute", reason: "shape:agentic-loop" };
-    if (this.explore.test(s.lastUser)) return { class: "explore", reason: "keyword:explore" };
-    // Trivial: the opening ask of a conversation, short, no tools, small context. Titles, one-line questions, summaries.
-    if (allowTrivial && s.dialogTurns <= 1 && s.tools === 0 && s.lastUser.length > 0 && s.lastUser.length <= shape.trivialMaxChars && s.inputTokens <= shape.trivialMaxInputTokens)
-      return { class: "trivial", reason: "shape:trivial" };
-    if (this.execute.test(s.lastUser)) return { class: "execute", reason: "keyword:execute" };
-    return { class: "execute", reason: "default" };
-  }
-
-  route(body: Json, requested: Rung, header?: string): Decision {
-    const ladder = this.cfg.families[requested.family].map((r) => ({ ...r, family: requested.family }));
-    const at = (i: number) => ladder[Math.min(Math.max(i, 0), ladder.length - 1)];
-    const off = (reason: string): Decision => ({ rung: requested, undecided: false, class: null, classReason: reason, conversationKey: null, sticky: false, escalated: false, escalationReason: null });
-    const classes = this.rc.classes[requested.family];
-    if (!this.rc.enabled) return off("disabled");
-    if (header === "off") return off("header:off");
-    if (!classes) return off("no-classes");
-
-    const reqIdx = ladder.findIndex((r) => r.alias === requested.alias);
-    const start = (c: Class) => ladder.findIndex((r) => r.alias === classes[c]);
-    const hasTrivial = classes.trivial !== undefined;
-    // Signal 1: a request below the execute floor is the client's explicit cheap choice (Claude Code's haiku subagents
-    // and titles): execute at that rung, never upgraded, not tracked. `auto` aliases carry no such choice.
-    if (!requested.auto && reqIdx < start("execute")) return { ...off("client-model:pinned"), class: "execute" };
-
-    const s = promptShape(body);
-    const key = sha(s.userId + "\0" + s.system + "\0" + s.firstUser).slice(0, 16);
-    const prompt = sha(JSON.stringify(body.messages ?? null));
-    const now = Date.now();
-    let entry = this.conv.get(key);
-    let escalationReason: string | null = null;
-    let escalated = false;
-    let classReason: string;
-
-    // A trivial entry that was never escalated is re-classified every turn: stickiness exists to protect prompt caching,
-    // and a trivial request has nothing worth caching. Once the conversation grows it gets a normal, sticky class.
-    if (entry && entry.class === "trivial" && entry.rung === start("trivial") && this.classify(body, s, hasTrivial).class !== "trivial") entry = undefined;
-    if (entry) {
-      classReason = "sticky";
-      // Signal: identical prompt re-sent within the retry window = the client gave up on the last answer.
-      if (entry.lastPrompt === prompt && now - entry.lastSeen <= this.rc.retryWindowMs) {
-        escalationReason = "retry";
-        escalated = this.bump(entry, ladder.length);
-      } else if (this.rc.upgradeOnIntent && isUserTurn(body)) {
-        // Upgrade on intent: a new user turn that explicitly asks for exploration (explore keyword, thinking on) moves the
-        // conversation up to that class. Shape signals do not count, and nothing ever moves a conversation down.
-        const c = this.classify(body, s, hasTrivial);
-        if (RANK[c.class] > RANK[entry.class] && (c.reason === "thinking" || c.reason === "keyword:explore")) {
-          entry.class = c.class;
-          entry.rung = Math.max(entry.rung, start(c.class));
-          classReason = `upgrade:${c.reason}`;
-        }
-      }
-    } else {
-      const c = this.classify(body, s, hasTrivial);
-      classReason = c.reason;
-      entry = { class: c.class, rung: start(c.class), lastSeen: now, lastPrompt: "" };
-    }
-    const sticky = classReason === "sticky";
-    this.touch(key, entry, now, prompt);
-    let cls = entry.class;
-    let idx = entry.rung;
-    if (header === "explore" || header === "execute" || (header === "trivial" && hasTrivial)) {
-      // Per-request override: forces the class for this request, leaves the sticky entry alone.
-      cls = header;
-      idx = start(header);
-      classReason = `header:${header}`;
-    }
-    // The client's model is a floor for execute/explore. A trivial verdict is the one case that goes below it: the
-    // request has been judged too small to need the model the client named (`trivialBelowFloor`, default true).
-    const floored = requested.auto || (cls === "trivial" && this.rc.trivialBelowFloor) ? idx : this.floor(idx, reqIdx);
-    // "Undecided" = the rules fell through to keyword/default/trivial-shape on a fresh classification; that is when a model
-    // classifier adds information. Thinking and shape signals are considered decisive, as is anything sticky or forced.
-    const soft = /^(default|keyword:.*|shape:trivial)$/.test(classReason);
-    const undecided = soft && (this.rc.classifier.mode === "always" || classReason === "default");
-    return { rung: at(floored), undecided, class: cls, classReason, conversationKey: key, sticky, escalated, escalationReason };
-  }
-
-  /**
-   * Apply a model classifier's verdict to a decision route() just made (same request). Replaces the conversation's class
-   * and starting rung, keeps any escalation, and re-derives the rung with the same floor rules.
-   */
-  reclassify(d: Decision, requested: Rung, verdict: Class, reason: string): Decision {
-    const classes = this.rc.classes[requested.family];
-    if (!d.conversationKey || !classes) return d;
-    const entry = this.conv.get(d.conversationKey);
-    if (!entry) return d;
-    const ladder = this.cfg.families[requested.family].map((r) => ({ ...r, family: requested.family }));
-    const cls: Class = verdict === "trivial" && classes.trivial === undefined ? "execute" : verdict;
-    const startIdx = ladder.findIndex((r) => r.alias === classes[cls]);
-    const bumped = entry.rung - ladder.findIndex((r) => r.alias === classes[entry.class]); // escalations already applied
-    entry.class = cls;
-    entry.rung = Math.min(startIdx + Math.max(bumped, 0), ladder.length - 1);
-    const reqIdx = ladder.findIndex((r) => r.alias === requested.alias);
-    const floored = requested.auto || (cls === "trivial" && this.rc.trivialBelowFloor) ? entry.rung : this.floor(entry.rung, reqIdx);
-    return { ...d, rung: ladder[Math.min(Math.max(floored, 0), ladder.length - 1)], class: cls, classReason: reason, undecided: false };
-  }
-
-  /** Feed the response back; bumps the conversation one rung on an observable failure. Returns the reason if one fired. */
-  observe(d: Decision, o: Outcome): { escalated: boolean; reason: string | null } {
-    const none = { escalated: false, reason: null };
-    if (!d.conversationKey || o.aborted) return none;
-    const entry = this.conv.get(d.conversationKey);
-    if (!entry) return none;
-    const reason =
-      o.errorStatus === 429 || (o.errorStatus ?? 0) >= 500 ? `bedrock:${o.errorStatus}`
-      : o.stopReason === "max_tokens" ? "max_tokens"
-      : o.malformedToolJson ? "malformed-tool-json"
-      : o.outputTokens === 0 ? "empty"
-      : null;
-    if (!reason) return none;
-    return { escalated: this.bump(entry, this.cfg.families[d.rung.family].length), reason };
-  }
-
-  private floor(idx: number, reqIdx: number) { return this.rc.honorClientModel ? Math.max(idx, reqIdx) : idx; }
-
-  private bump(entry: Entry, ladderLen: number): boolean {
-    if (entry.rung >= ladderLen - 1) return false; // never past the family's strongest
-    entry.rung += 1;
-    return true;
-  }
-
-  private touch(key: string, entry: Entry, now: number, prompt: string) {
-    entry.lastSeen = now;
-    entry.lastPrompt = prompt;
-    this.conv.delete(key);
-    this.conv.set(key, entry);
-    if (this.conv.size > this.rc.maxConversations) this.conv.delete(this.conv.keys().next().value!);
-  }
-}
-
-/** Accumulates streamed tool-call JSON fragments so a truncated/invalid argument object can be detected at end of stream. */
-export class ToolJsonCheck {
-  private parts = new Map<number, string>();
-  add(index: number, fragment: string) { this.parts.set(index, (this.parts.get(index) ?? "") + fragment); }
-  malformed(): boolean {
-    for (const s of this.parts.values()) { try { JSON.parse(s || "{}"); } catch { return true; } }
-    return false;
-  }
-}
+export class ToolJsonCheck{private parts=new Map<number,string>();add(i:number,f:string){this.parts.set(i,(this.parts.get(i)??"")+f)}malformed(){for(const s of this.parts.values())try{JSON.parse(s||"{}")}catch{return true}return false}}

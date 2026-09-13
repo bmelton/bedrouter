@@ -1,122 +1,23 @@
 {
-  "_pricing": "USD per 1M tokens for the us.* cross-region profiles: Anthropic's published Bedrock rates plus the 10% regional premium (https://aws.amazon.com/bedrock/pricing/, https://platform.claude.com/docs/en/about-claude/pricing). gpt-oss rows are the US East on-demand rates from the Bedrock pricing page.",
-  "families": {
-    "anthropic": [
-      {
-        "alias": "haiku",
-        "bedrockId": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        "inputPerM": 1.1,
-        "outputPerM": 5.5
-      },
-      {
-        "alias": "sonnet",
-        "bedrockId": "us.anthropic.claude-sonnet-5",
-        "inputPerM": 2.2,
-        "outputPerM": 11
-      },
-      {
-        "alias": "opus",
-        "bedrockId": "us.anthropic.claude-opus-5",
-        "inputPerM": 5.5,
-        "outputPerM": 27.5
-      },
-      {
-        "alias": "fable",
-        "bedrockId": "us.anthropic.claude-fable-5-1",
-        "inputPerM": 11,
-        "outputPerM": 55
-      }
-    ],
-    "openai": [
-      {
-        "alias": "gpt-oss-20b",
-        "bedrockId": "openai.gpt-oss-20b-1:0",
-        "inputPerM": 0.07,
-        "outputPerM": 0.2
-      },
-      {
-        "alias": "gpt-oss-120b",
-        "bedrockId": "openai.gpt-oss-120b-1:0",
-        "inputPerM": 0.15,
-        "outputPerM": 0.6
-      }
-    ]
-  },
-  "aliases": {
-    "claude-haiku-4-5": "haiku",
-    "claude-haiku-4-5-20251001": "haiku",
-    "claude-sonnet-5": "sonnet",
-    "claude-opus-5": "opus",
-    "claude-fable-5-1": "fable",
-    "gpt-oss": "gpt-oss-120b",
-    "auto": "auto:anthropic",
-    "auto-oss": "auto:openai"
-  },
-  "routing": {
-    "enabled": true,
-    "honorClientModel": true,
-    "trivialBelowFloor": true,
-    "upgradeOnIntent": true,
-    "classifier": {
-      "enabled": true,
-      "model": "haiku",
-      "mode": "fallback",
-      "maxChars": 4000,
-      "timeoutMs": 4000
-    },
-    "maxConversations": 1000,
-    "retryWindowMs": 60000,
-    "classes": {
-      "anthropic": {
-        "trivial": "haiku",
-        "execute": "sonnet",
-        "explore": "opus"
-      },
-      "openai": {
-        "execute": "gpt-oss-20b",
-        "explore": "gpt-oss-120b"
-      }
-    },
-    "shape": {
-      "exploreInputTokens": 60000,
-      "exploreTools": 40,
-      "executeTurns": 8,
-      "executeLastUserChars": 200,
-      "trivialMaxChars": 300,
-      "trivialMaxInputTokens": 1500
-    },
-    "keywords": {
-      "explore": [
-        "design",
-        "architect",
-        "architecture",
-        "plan",
-        "investigate",
-        "why",
-        "compare",
-        "tradeoff",
-        "trade-off",
-        "refactor the whole",
-        "explore",
-        "research",
-        "evaluate",
-        "propose",
-        "brainstorm"
-      ],
-      "execute": [
-        "implement",
-        "fix",
-        "add test",
-        "add a test",
-        "rename",
-        "update",
-        "apply",
-        "bump",
-        "write",
-        "change",
-        "remove",
-        "delete"
-      ]
-    }
-  }
+  "_pricing": "USD per 1M tokens, verified against AWS model cards and Bedrock pricing on 2026-09-13.",
+  "stack": [
+    { "alias": "nova-micro", "bedrockId": "us.amazon.nova-micro-v1:0", "vendor": "amazon", "enabled": true, "inputPerM": 0.035, "outputPerM": 0.14, "serves": ["trivial"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": true, "streaming": true, "imageInput": false, "structuredOutputs": false, "promptCaching": true, "contextWindow": 128000, "maxOutput": 5000 } },
+    { "alias": "nova-lite", "bedrockId": "us.amazon.nova-lite-v1:0", "vendor": "amazon", "enabled": true, "inputPerM": 0.06, "outputPerM": 0.24, "serves": ["trivial"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": true, "streaming": true, "imageInput": true, "structuredOutputs": false, "promptCaching": true, "contextWindow": 300000, "maxOutput": 5000 } },
+    { "alias": "gpt-oss-20b", "bedrockId": "openai.gpt-oss-20b-1:0", "vendor": "openai", "enabled": true, "inputPerM": 0.07, "outputPerM": 0.30, "serves": ["trivial"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": true, "streaming": true, "imageInput": false, "structuredOutputs": true, "promptCaching": false, "contextWindow": 128000, "maxOutput": 16000 } },
+    { "alias": "glm-4.7-flash", "bedrockId": "zai.glm-4.7-flash", "vendor": "zai", "enabled": true, "inputPerM": 0.07, "outputPerM": 0.40, "serves": ["trivial"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": false, "streaming": true, "imageInput": false, "structuredOutputs": true, "promptCaching": false, "contextWindow": 203000, "maxOutput": 4000 } },
+    { "alias": "gpt-oss-120b", "bedrockId": "openai.gpt-oss-120b-1:0", "vendor": "openai", "enabled": true, "inputPerM": 0.15, "outputPerM": 0.60, "serves": ["execute"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": true, "streaming": true, "imageInput": false, "structuredOutputs": true, "promptCaching": false, "contextWindow": 128000, "maxOutput": 16000 } },
+    { "alias": "minimax-m2.5", "bedrockId": "minimax.minimax-m2.5", "vendor": "minimax", "enabled": true, "inputPerM": 0.30, "outputPerM": 1.20, "serves": ["execute"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": false, "streaming": true, "imageInput": false, "structuredOutputs": true, "promptCaching": false, "contextWindow": 196000, "maxOutput": 8000 } },
+    { "alias": "qwen3-coder-next", "bedrockId": "qwen.qwen3-coder-next", "vendor": "qwen", "enabled": true, "inputPerM": 0.50, "outputPerM": 1.20, "serves": ["execute"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": false, "streaming": true, "imageInput": false, "structuredOutputs": true, "promptCaching": false, "contextWindow": 256000, "maxOutput": 16000 } },
+    { "alias": "qwen3-235b", "bedrockId": "qwen.qwen3-235b-a22b-2507-v1:0", "vendor": "qwen", "enabled": true, "inputPerM": 0.22, "outputPerM": 0.88, "serves": ["execute"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": true, "streaming": true, "imageInput": false, "structuredOutputs": true, "promptCaching": false, "contextWindow": 256000, "maxOutput": 8000 } },
+    { "alias": "kimi-k2.5", "bedrockId": "moonshotai.kimi-k2.5", "vendor": "moonshotai", "enabled": true, "inputPerM": 0.60, "outputPerM": 3.00, "serves": ["execute"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": false, "streaming": true, "imageInput": true, "structuredOutputs": true, "promptCaching": false, "contextWindow": 256000, "maxOutput": 16000 } },
+    { "alias": "glm-4.7", "bedrockId": "zai.glm-4.7", "vendor": "zai", "enabled": true, "inputPerM": 0.60, "outputPerM": 2.20, "serves": ["execute"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": false, "streaming": true, "imageInput": false, "structuredOutputs": true, "promptCaching": false, "contextWindow": 203000, "maxOutput": 4000 } },
+    { "alias": "nova-pro", "bedrockId": "us.amazon.nova-pro-v1:0", "vendor": "amazon", "enabled": true, "inputPerM": 0.80, "outputPerM": 3.20, "serves": ["execute"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": true, "streaming": true, "imageInput": true, "structuredOutputs": false, "promptCaching": true, "contextWindow": 300000, "maxOutput": 5000 } },
+    { "alias": "glm-5", "bedrockId": "zai.glm-5", "vendor": "zai", "enabled": true, "inputPerM": 1.00, "outputPerM": 3.20, "serves": ["execute", "explore"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": false, "streaming": true, "imageInput": false, "structuredOutputs": true, "promptCaching": false, "contextWindow": 200000, "maxOutput": 128000 } },
+    { "alias": "haiku", "bedrockId": "us.anthropic.claude-haiku-4-5-20251001-v1:0", "vendor": "anthropic", "enabled": true, "inputPerM": 1.10, "outputPerM": 5.50, "serves": ["trivial", "execute"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": true, "streaming": true, "imageInput": true, "structuredOutputs": false, "promptCaching": true, "contextWindow": 200000, "maxOutput": 64000 } },
+    { "alias": "sonnet", "bedrockId": "us.anthropic.claude-sonnet-5", "vendor": "anthropic", "enabled": true, "inputPerM": 2.20, "outputPerM": 11.00, "serves": ["execute", "explore"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": true, "streaming": true, "imageInput": true, "structuredOutputs": false, "promptCaching": true, "contextWindow": 1000000, "maxOutput": 128000 } },
+    { "alias": "opus", "bedrockId": "us.anthropic.claude-opus-5", "vendor": "anthropic", "enabled": true, "inputPerM": 5.50, "outputPerM": 27.50, "serves": ["explore"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": true, "streaming": true, "imageInput": true, "structuredOutputs": false, "promptCaching": true, "contextWindow": 1000000, "maxOutput": 128000 } },
+    { "alias": "fable", "bedrockId": "us.anthropic.claude-fable-5-1", "vendor": "anthropic", "enabled": false, "inputPerM": 11.00, "outputPerM": 55.00, "serves": ["explore"], "capabilities": { "transport": "bedrock-runtime", "api": "converse", "toolUse": true, "streaming": true, "imageInput": true, "structuredOutputs": false, "promptCaching": true, "contextWindow": 1000000, "maxOutput": 128000 } }
+  ],
+  "aliases": { "claude-haiku-4-5": "haiku", "claude-sonnet-5": "sonnet", "claude-opus-5": "opus", "gpt-oss": "gpt-oss-120b" },
+  "routing": { "enabled": true, "honorClientModel": true, "trivialBelowFloor": true, "upgradeOnIntent": true, "cacheHitRate": 0.8, "classifier": { "enabled": true, "model": "nova-micro", "mode": "fallback", "maxChars": 4000, "timeoutMs": 4000 }, "maxConversations": 1000, "retryWindowMs": 60000, "shape": { "exploreInputTokens": 60000, "exploreTools": 40, "executeTurns": 8, "executeLastUserChars": 200, "trivialMaxChars": 300, "trivialMaxInputTokens": 1500 }, "keywords": { "explore": ["design", "architect", "architecture", "plan", "investigate", "why", "compare", "tradeoff", "trade-off", "refactor the whole", "explore", "research", "evaluate", "propose", "brainstorm"], "execute": ["implement", "fix", "add test", "add a test", "rename", "update", "apply", "bump", "write", "change", "remove", "delete"] } }
 }

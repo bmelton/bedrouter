@@ -16,8 +16,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   if (!pf.ok) { console.log("smoke: skipped (no usable credentials)"); return 0; }
 
   const cfg = loadConfig();
-  const anthropicModel = cfg.families.anthropic[0]?.alias;
-  const openaiModel = cfg.families.openai[0]?.alias;
+  const anthropicModel = cfg.stack.find((r) => r.enabled && r.vendor === "anthropic")?.alias;
+  const openaiModel = "auto";
 
   async function sse(url: string, body: unknown, headers: Record<string, string> = {}) {
     const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
