@@ -155,6 +155,16 @@ function checkAuth(req: http.IncomingMessage) {
   if (got !== want) throw new HttpError(401, "invalid api key");
 }
 
+/** Bedrock rejects an output cap above the model's own limit, so bring the client's ceiling down to what this rung allows. */
+export function forRung(body: Json, rung: Rung): Json {
+  const want = Router.maxTokens(body), limit = rung.capabilities.maxOutput;
+  if (!want || want <= limit) return body;
+  const out = { ...body };
+  if (out.max_completion_tokens != null) out.max_completion_tokens = limit;
+  if (out.max_tokens != null) out.max_tokens = limit;
+  return out;
+}
+
 export function stripCachePoints(value: Json): Json {
   if (Array.isArray(value)) return value.filter((item) => !(item && typeof item === "object" && Object.hasOwn(item, "cachePoint"))).map(stripCachePoints);
   if (!value || typeof value !== "object") return value;
@@ -162,6 +172,11 @@ export function stripCachePoints(value: Json): Json {
 }
 
 const capabilityValidation = (err: Json) => err?.name === "ValidationException" && /unsupported|not support|cache|tool|image|schema|stream|max.?token|context/i.test(err?.message ?? "");
+// This account cannot invoke the rung at all: no entitlement, or an id this region does not offer. Bedrock validates
+// ids before IAM, so both verdicts are facts about (account, region, rung) and never about the request.
+const unavailableModel = (err: Json) => err?.name === "AccessDeniedException" || (err?.name === "ValidationException" && /model identifier is invalid/i.test(err?.message ?? ""));
+// ponytail: four tries covers the longest denied prefix of a real stack; the last error reaches the client if it does not.
+const MAX_REROUTES = 3;
 
 export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRuntimeClient, "send"> = new BedrockRuntimeClient({ region })): http.Server {
   const table = modelTable(cfg);
@@ -298,42 +313,39 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
 
   // --- POST /v1/chat/completions: OpenAI shape, translated to Converse (any family) -----------------
   async function handleChat(req: http.IncomingMessage, res: http.ServerResponse, body: Json, log: LogEntry, ac: AbortController, rt: RouteCtx) {
-    let rung = await route(req, body, log, rt);
-    let routedBody = rt.decision?.degraded.length ? stripCachePoints(body) : body;
-    let input = openaiToConverse(routedBody, rung.bedrockId);
     const names = toolNameMap(body);
+
+    /** Send, and when the chosen rung itself is the problem, drop it and reselect. Returns the rung that answered. */
+    const sendRouted = async <T>(send: (input: Json) => Promise<T>): Promise<{ out: T; rung: Rung }> => {
+      let rung = await route(req, body, log, rt);
+      for (let tries = 0; ; tries++) {
+        const routedBody = forRung(rt.decision?.degraded.length ? stripCachePoints(body) : body, rung);
+        try { return { out: await send(openaiToConverse(routedBody, rung.bedrockId)), rung }; }
+        catch (err) {
+          const fatal = unavailableModel(err) ? "unavailable" : capabilityValidation(err) ? "validation-contradiction" : null;
+          if (!fatal || !rt.decision || tries >= MAX_REROUTES) throw err;
+          const rejected = rung.alias;
+          if (fatal === "unavailable") router.markUnavailable(rejected);
+          else if (!router.invalidate(rt.decision, body)) throw err;
+          // nothing left to reselect: Bedrock's own verdict is more useful than "no eligible rung"
+          try { rung = await route(req, body, log, rt); } catch { throw err; }
+          // after the reroute, which replaces log.skipped wholesale. A learned denial needs no note: eligible() reports it.
+          if (fatal !== "unavailable") log.skipped.push(`${rejected}:${fatal}`);
+        }
+      }
+    };
     const id = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     const usageOf = (u: Json): Usage => ({ input: u?.inputTokens ?? 0, output: u?.outputTokens ?? 0, cacheRead: u?.cacheReadInputTokens, cacheWrite: u?.cacheWriteInputTokens });
 
     if (!body.stream) {
-      let out;
-      try { out = await client.send(new ConverseCommand(input), { abortSignal: ac.signal }); }
-      catch (err) {
-        if (!capabilityValidation(err) || !rt.decision || !router.invalidate(rt.decision, body)) throw err;
-        const contradicted = rung.alias;
-        rung = await route(req, body, log, rt);
-        log.skipped.push(`${contradicted}:validation-contradiction`);
-        routedBody = rt.decision?.degraded.length ? stripCachePoints(body) : body;
-        input = openaiToConverse(routedBody, rung.bedrockId);
-        out = await client.send(new ConverseCommand(input), { abortSignal: ac.signal });
-      }
+      const { out, rung } = await sendRouted((input) => client.send(new ConverseCommand(input), { abortSignal: ac.signal }));
       log.stopReason = out.stopReason ?? null;
       finishUsage(log, rung, usageOf(out.usage), rt);
       for (const [k, v] of Object.entries(decisionHeaders(log))) res.setHeader(k, v);
       return sendJson(res, 200, converseToOpenai(out, body.model, id, names));
     }
 
-    let out;
-    try { out = await client.send(new ConverseStreamCommand(input), { abortSignal: ac.signal }); }
-    catch (err) {
-      if (!capabilityValidation(err) || !rt.decision || !router.invalidate(rt.decision, body)) throw err;
-      const contradicted = rung.alias;
-      rung = await route(req, body, log, rt);
-      log.skipped.push(`${contradicted}:validation-contradiction`);
-      routedBody = rt.decision?.degraded.length ? stripCachePoints(body) : body;
-      input = openaiToConverse(routedBody, rung.bedrockId);
-      out = await client.send(new ConverseStreamCommand(input), { abortSignal: ac.signal });
-    }
+    const { out, rung } = await sendRouted((input) => client.send(new ConverseStreamCommand(input), { abortSignal: ac.signal }));
     startSse(res, decisionHeaders(log));
     const st = newStreamState(body.model, id, names);
     for await (const ev of out.stream ?? []) {

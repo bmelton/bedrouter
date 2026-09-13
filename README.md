@@ -67,17 +67,59 @@ classes it serves and the request features it supports:
 }
 ```
 
-The order is authoritative. For a `trivial`, `execute`, or `explore`
-request, the router chooses the first enabled rung that serves the class and
+Rungs are selected cheapest-first by *effective* input price, which is the list
+price adjusted for prompt caching at the configured `cacheHitRate`: a cache read
+bills at a tenth, so a caching rung at `$1.00` beats a non-caching rung at
+`$0.50` once the hit rate reaches 0.8. Agentic traffic re-sends the whole prompt
+every turn, so this ordering, not the list price, is what a session actually
+costs. The configured order is the tiebreak. `bedrouter stack --explain` prints
+both figures.
+
+For a `trivial`, `execute`, or `explore`
+request, the router chooses the first eligible rung that serves the class and
 supports the request shape. Tools, images, streaming, structured output, output
 size, and context size filter the eligible set. A prompt cache point sent to a
 model without prompt caching is stripped and recorded as a degradation.
+
+Classification reads only what the human typed. A harness that speaks in the
+user's name, with a session digest, a watcher wake, or an agent nudge, is skipped:
+a user turn is treated as injected when it starts with one of
+`routing.injectedMarkers` (default `U+2063`, the invisible separator firstmate
+prefixes) or exceeds `routing.shape.humanTurnMaxChars`. Without this, a single
+word inside a 17KB digest sets the class for a whole session.
+
+Every human turn re-decides the class. Raising it needs a strong signal, so a
+conversation does not thrash upward, and `upgradeOnIntent` gates that. Lowering
+it needs none, and is recorded as `downgrade:<reason>`, because a class that
+sticks forever turns one bad guess into the price of every later request.
 
 Conversations stay on their current vendor while that vendor has an eligible
 rung. Retries, throttling, server failures, truncated output, empty output, and
 malformed tool JSON move the next request rightward through the eligible stack.
 A capability-related Bedrock `ValidationException` excludes the contradicted
 rung and retries the same request once.
+
+The stack may list rungs this account cannot invoke, so one config file is
+portable across accounts. An `AccessDeniedException`, or a `ValidationException`
+that reports an invalid model identifier, is a fact about the account and the
+region rather than the request. The router drops that rung and answers the same
+request from the next eligible rung. The drop lasts for the life of the process,
+so each denied rung costs one failed call per restart, and a new entitlement
+needs no config edit. Up to three reselections run per request; after that the
+Bedrock error reaches the client. `skipped[]` records each dropped rung as
+`<alias>:unavailable`.
+
+An output cap is a ceiling, not a requirement. The router reads it from
+`max_completion_tokens` or `max_tokens`, and prefers a rung that can honour it
+in full. When no rung can, the chosen rung answers within its own limit, the
+outgoing value is lowered to match, and `degraded[]` records
+`<alias>:clamp-maxTokens:<limit>`. A reply that truly stops at the cap still
+raises the class for the next request.
+
+When no rung serves the chosen class, the class degrades one step, from
+`explore` to `execute` to `trivial`, and the reason becomes `degrade:<class>`. A
+weaker answer beats a failed request. Emptiness caused by a capability filter is
+unaffected, because the same filter applies to every class.
 
 At startup, every class must retain at least one enabled rung. This prevents a
 probe or manual edit from silently leaving a class unroutable.

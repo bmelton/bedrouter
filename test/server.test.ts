@@ -22,4 +22,52 @@ test("messages remains a native path for pinned Anthropic rungs and refuses auto
 
 test("auto uses chat/Converse, exposes stack metadata, and strips cache points only when needed",async()=>{const sent:any[]=[];await run(cfg,async c=>{sent.push(c.input);return reply},async base=>{const body={model:"auto",messages:[{role:"user",content:"implement it"},{cachePoint:{type:"default"}}]};const out=await post(base,"/v1/chat/completions",body);assert.equal(out.r.status,200);assert.equal(sent[0].modelId,"w");assert.doesNotMatch(JSON.stringify(sent[0]),/cachePoint/);const models=await(await fetch(base+"/v1/models")).json();const auto=models.data.find((m:any)=>m.id==="auto");assert.equal(auto.bedrouter.vendor,"openai");assert.deepEqual(auto.bedrouter.serves,["execute"]);assert.equal(auto.bedrouter.capabilities.maxOutput,64000)})});
 
+test("the output cap is read from either OpenAI field, never steers selection, and is clamped per rung",async()=>{
+ // a dearer rung that could deliver the full 128k must NOT be preferred: clients send a defensive ceiling, not a
+ // requirement, so honouring it would silently buy capacity almost no turn uses
+ const big={...cfg.stack[1],alias:"big",bedrockId:"b",inputPerM:9,capabilities:{...cap,maxOutput:128000}};
+ const picked:string[]=[];
+ await run({...cfg,stack:[...cfg.stack,big]},async c=>{picked.push(c.input.modelId);return reply},async base=>{
+  assert.equal((await post(base,"/v1/chat/completions",{model:"auto",max_completion_tokens:128000,messages:[{role:"user",content:"implement it"}]})).r.status,200);
+  assert.deepEqual(picked,["w"],"must stay on the cheap rung and clamp, not jump to the 128k rung");
+ });
+ // the outgoing value is brought down to the chosen rung's own limit
+ const sent:any[]=[];
+ await run(cfg,async c=>{sent.push(c.input);return reply},async base=>{
+  const out=await post(base,"/v1/chat/completions",{model:"auto",max_completion_tokens:128000,messages:[{role:"user",content:"implement it"}]});
+  assert.equal(out.r.status,200);
+  assert.equal(sent[0].inferenceConfig.maxTokens,64000,"must be clamped to the rung limit, not sent as asked");
+  const log=JSON.parse(fs.readFileSync(process.env.BEDROUTER_LOG!,"utf8").trim().split("\n").at(-1)!);
+  assert.ok(log.degraded.some((x:string)=>x.startsWith("work:clamp-maxTokens")),`expected a clamp note in ${log.degraded}`);
+ });
+});
+
+test("an unentitled rung is dropped inside the request, then stays out of the pool",async()=>{
+ const ids:string[]=[];
+ const denied=(id:string)=>Object.assign(new Error(`anthropic.x is not available for this account`),{name:"AccessDeniedException",$metadata:{httpStatusCode:403}});
+ // explore wants "deep" first; this account cannot invoke it, so the request must still be answered by "work".
+ await run(cfg,async c=>{ids.push(c.input.modelId);if(c.input.modelId==="d")throw denied("d");return reply},async base=>{
+  const first=await post(base,"/v1/chat/completions",{model:"auto",messages:[{role:"user",content:"design the whole system"}]});
+  assert.equal(first.r.status,200);
+  assert.deepEqual(ids,["d","w"]);
+  const log=JSON.parse(fs.readFileSync(process.env.BEDROUTER_LOG!,"utf8").trim().split("\n").at(-1)!);
+  assert.equal(log.routedModel,"work");
+  assert.ok(log.skipped.some((x:string)=>x==="deep:unavailable"),`expected deep:unavailable in ${log.skipped}`);
+  // a different conversation must not pay the failed call again
+  const second=await post(base,"/v1/chat/completions",{model:"auto",messages:[{role:"user",content:"design a different system"}]});
+  assert.equal(second.r.status,200);
+  assert.deepEqual(ids,["d","w","w"],"the denied rung must not be tried a second time");
+ });
+});
+
+test("a rung denied for every eligible class surfaces the error instead of looping",async()=>{
+ const only:Config={...cfg,stack:[cfg.stack[2]]};
+ let calls=0;
+ await run(only,async()=>{calls++;throw Object.assign(new Error("not available for this account"),{name:"AccessDeniedException",$metadata:{httpStatusCode:403}})},async base=>{
+  const out=await post(base,"/v1/chat/completions",{model:"auto",messages:[{role:"user",content:"design it"}]});
+  assert.equal(out.r.status,403);
+  assert.equal(calls,1,"nothing left to reselect, so no retry");
+ });
+});
+
 test("a capability ValidationException re-picks inside the same request and records the contradiction",async()=>{const ids:string[]=[];await run(cfg,async c=>{ids.push(c.input.modelId);if(ids.length===1)throw Object.assign(new Error("tool use is not supported"),{name:"ValidationException",$metadata:{httpStatusCode:400}});return reply},async base=>{const out=await post(base,"/v1/chat/completions",{model:"auto",messages:[{role:"user",content:"implement it"}]});assert.equal(out.r.status,200);assert.deepEqual(ids,["w","d"]);const log=JSON.parse(fs.readFileSync(process.env.BEDROUTER_LOG!,"utf8").trim().split("\n").at(-1)!);assert.equal(log.vendor,"anthropic");assert.ok(log.skipped.some((x:string)=>x.includes("validation-contradiction")))})});
