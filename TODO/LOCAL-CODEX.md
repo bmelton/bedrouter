@@ -155,6 +155,14 @@ accepted arbitrary tools anyway.
 
 This was the question that could have killed the feature. It did not.
 
+A full agent loop was then run through bedrouter itself: turn one returned a
+`read_file` tool call, turn two fed the result back as a `tool` message and got a
+coherent answer, both on `codex`. Image input was verified the same way, with a
+64x64 half-red half-blue PNG that the model described correctly, so
+`imageInput: true` is a measurement rather than a guess. The content part must be
+`{"type":"input_image","image_url":"data:..."}` with the URL as a **string**: the
+chat-completions shape, `image_url: {url}`, is refused with a 400.
+
 ### 2. Streaming is mandatory, not a capability
 
     {"detail": "Stream must be set to true"}   // 400
