@@ -315,6 +315,81 @@ aggregates only: counts, tokens, dollars, model aliases, and signal names.
 `classifierNote` is free text a model wrote about a prompt and can therefore
 quote one, so `aggregate()` drops it rather than the renderer hiding it.
 
+## Team stats
+
+Off unless a `publish` block is present. Nothing leaves a machine without it.
+
+```json
+"publish": { "enabled": true, "repo": "acme/bedrouter-stats", "branch": "main", "intervalMs": 3600000, "credential": "auto" }
+```
+
+With it, the running server checks hourly and writes one file per closed UTC day
+to one path in a shared repository:
+
+```
+data/<github-login>/2026-09-16.json
+```
+
+One writer per path, and each path written once. That is what makes the rest
+safe. Concurrent publishers cannot clobber each other, because the contents API
+updates the branch ref without force and a ref update is compare-and-swap: a
+publisher that loses the race gets `409`, re-reads the tip and retries, and has
+no content to reconcile. Backfill is not a separate feature; a laptop that was
+off for a week publishes seven files on its next check.
+
+A failed publish is never fatal and never blocks a request.
+
+| Command | What it does |
+| --- | --- |
+| `bedrouter publish --dry-run` | Prints the payloads without writing. This is how to see what the redaction rules actually emit before opting in |
+| `bedrouter publish --since 2026-09-01` | Publishes by hand, oldest day first, skipping days already present |
+| `bedrouter rollup data --prices prices.json --out dist` | Merges day files into the team page. The stats repository's Action runs this |
+
+### The credential
+
+`credential: "auto"` takes `gh auth token --hostname github.com` when `gh` is
+authenticated, and falls back to `BEDROUTER_PUBLISH_TOKEN` from the environment
+or `.env`. With neither, publishing logs the reason once and does nothing. Pin
+the source with `"gh"` or `"env"`.
+
+Identity comes from the credential, not from config: one `GET /user` gives the
+login that names the directory and the numeric id that goes in the file, because
+a login can be renamed and an id cannot. Nothing to typo, and no way to publish
+as somebody else.
+
+A `gh` token usually carries broad `repo` scope, which is wider than this needs.
+Nothing here can narrow a token at use time, so `bedrouter doctor` reports the
+source, the identity and the scopes instead, and the only path bedrouter ever
+writes is the one it builds itself. For least privilege, use a fine-grained PAT
+with `contents: write` on the stats repository alone and set `"credential":
+"env"`.
+
+### What is published, and what never is
+
+Token counts, never dollars. Savings computed on each laptop would depend on
+that machine's prices and how stale its config is, so the aggregate would sum
+numbers that were not computed the same way. The team page prices everything
+from one `prices.json` in the stats repository, so every person's numbers are
+comparable and a price correction re-prices every past day at once.
+
+A day file holds counts and sums grouped by routed rung and by requested rung,
+plus class counts, classifier call count, escalation counts, and error counts by
+class. It contains no array at all.
+
+Never published: `classifierNote`, `conversationKey`, `sessionKey`, error text,
+and anything per request. `dailyRollup()` builds the payload from an allowlist,
+so a field added to the log is excluded until somebody adds it there on purpose,
+and `test/publish.test.ts` holds it to a fixture line carrying every forbidden
+field.
+
+A day file still shows that a named person worked on a given date and roughly how
+much. In a public stats repository that is world-readable. It is inherent to
+per-person daily stats, and the stats repository's README says so on its face.
+
+Only closed UTC days are published, so a file is complete when written and never
+needs an update. Late lines for an already-published day are dropped rather than
+rewriting history.
+
 ## Logs
 
 Every request appends one JSON line to `BEDROUTER_LOG` (default

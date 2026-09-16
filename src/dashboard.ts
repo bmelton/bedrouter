@@ -37,7 +37,9 @@ export type AggregateOpts = {
 
 export type Bucket = { key: string; requests: number; costUsd: number; baselineUsd: number; requestedUsd: number; byRung: Record<string, number> };
 export type RouteRow = { requested: string; routed: string; requests: number; costUsd: number; baselineUsd: number; savedUsd: number; upgrade: boolean };
-export type ReasonRow = { reason: string; requests: number; costUsd: number };
+export type ReasonRow = { reason: string; requests: number; costUsd?: number };
+/** One developer's totals on the team page. Absent from a single-machine view, which has nobody to compare. */
+export type PersonRow = { login: string; requests: number; costUsd: number; baselineUsd: number; savedUsd: number; days: number };
 export type Totals = {
   requests: number; priced: number; errors: number; conversations: number;
   inputTokens: number; outputTokens: number; cacheReadTokens: number;
@@ -56,6 +58,9 @@ export type View = {
   buckets: Bucket[];
   byRoute: RouteRow[];
   byReason: ReasonRow[];
+  byPerson?: PersonRow[];
+  /** What the `byReason` panel is counting. The team page groups by class, because merged day files pair nothing. */
+  reasonTitle?: { panel: string; column: string };
 };
 
 /**
@@ -143,7 +148,7 @@ export function aggregate(lines: LogLine[], opts: AggregateOpts): View {
     const rsn = l.classReason ?? "(none)";
     let rr = reasons.get(rsn);
     if (!rr) reasons.set(rsn, (rr = { reason: rsn, requests: 0, costUsd: 0 }));
-    rr.requests++; rr.costUsd += cost;
+    rr.requests++; rr.costUsd = (rr.costUsd ?? 0) + cost;
   }
 
   // The classifier is what the router spends to make its decision, so it is subtracted from savings, as report.ts does.
@@ -161,7 +166,7 @@ export function aggregate(lines: LogLine[], opts: AggregateOpts): View {
     rungs: [...rungCost.keys()].sort((a, b) => (opts.ranks[a] ?? 1e9) - (opts.ranks[b] ?? 1e9) || a.localeCompare(b)),
     buckets: [...buckets.values()].sort((a, b) => a.key.localeCompare(b.key)),
     byRoute: [...routes.values()].sort((a, b) => b.costUsd - a.costUsd),
-    byReason: [...reasons.values()].sort((a, b) => b.costUsd - a.costUsd),
+    byReason: [...reasons.values()].sort((a, b) => (b.costUsd ?? 0) - (a.costUsd ?? 0)),
   };
 }
 
@@ -267,10 +272,23 @@ export function renderHtml(view: View, opts: { generatedAt: string; live?: boole
   const legend = view.rungs.map((r) => `<span><i class="sw" style="background:${colour(r)}"></i>${esc(r)}</span>`).join("") +
     `<span><i class="sw" style="background:var(--muted);opacity:.35"></i>${esc(view.baseline.alias)} baseline</span>`;
 
-  const reasonRows = view.byReason.map((r) => `<tr><td>${esc(r.reason)}</td><td class="n">${num(r.requests)}</td><td class="n">${usd(r.costUsd)}</td></tr>`).join("") ||
-    `<tr><td colspan="3" class="empty">Nothing yet.</td></tr>`;
-  const routeRows = view.byRoute.map((r) => `<tr><td>${esc(r.requested)} &rarr; ${esc(r.routed)}</td><td class="n">${num(r.requests)}</td><td class="n">${usd(r.costUsd)}</td><td class="n ${sign(r.savedUsd)}">${usd(r.savedUsd)}</td></tr>`).join("") ||
-    `<tr><td colspan="4" class="empty">Nothing yet.</td></tr>`;
+  // Only the panels the data can fill are rendered. Merged day files pair no requested rung with a routed one, so
+  // the team page has no `requested -> routed` table and shows a per-person one instead.
+  const reasonCost = view.byReason.some((r) => r.costUsd != null);
+  const reasonTitle = view.reasonTitle ?? { panel: "What the router did", column: "Deciding signal" };
+  const reasonPanel = !view.byReason.length ? "" : `<div class="panel"><h2>${esc(reasonTitle.panel)}</h2>
+    <table><thead><tr><th>${esc(reasonTitle.column)}</th><th class="n">Requests</th>${reasonCost ? `<th class="n">Cost</th>` : ""}</tr></thead><tbody>${
+      view.byReason.map((r) => `<tr><td>${esc(r.reason)}</td><td class="n">${num(r.requests)}</td>${reasonCost ? `<td class="n">${usd(r.costUsd ?? 0)}</td>` : ""}</tr>`).join("")
+    }</tbody></table></div>`;
+  const routePanel = !view.byRoute.length ? "" : `<div class="panel"><h2>Where the money went</h2>
+    <table><thead><tr><th>Requested &rarr; routed</th><th class="n">Requests</th><th class="n">Cost</th><th class="n">Saved</th></tr></thead><tbody>${
+      view.byRoute.map((r) => `<tr><td>${esc(r.requested)} &rarr; ${esc(r.routed)}</td><td class="n">${num(r.requests)}</td><td class="n">${usd(r.costUsd)}</td><td class="n ${sign(r.savedUsd)}">${usd(r.savedUsd)}</td></tr>`).join("")
+    }</tbody></table></div>`;
+  const personPanel = !view.byPerson?.length ? "" : `<div class="panel"><h2>By person</h2>
+    <table><thead><tr><th>Developer</th><th class="n">Days</th><th class="n">Requests</th><th class="n">Cost</th><th class="n">Saved</th></tr></thead><tbody>${
+      view.byPerson.map((p) => `<tr><td>${esc(p.login)}</td><td class="n">${num(p.days)}</td><td class="n">${num(p.requests)}</td><td class="n">${usd(p.costUsd)}</td><td class="n ${sign(p.savedUsd)}">${usd(p.savedUsd)}</td></tr>`).join("")
+    }</tbody></table></div>`;
+  const panels = [reasonPanel, routePanel, personPanel].filter(Boolean).join("\n  ") || `<p class="empty">Nothing yet.</p>`;
 
   const window = view.window.fromIso ? `${view.window.fromIso.slice(0, 16).replace("T", " ")} to ${view.window.toIso!.slice(0, 16).replace("T", " ")} UTC` : "no requests in range";
   // ponytail: auto-refresh reloads the page rather than re-rendering from data.json in the browser, which would mean a
@@ -298,15 +316,16 @@ ${controls}
 ${tile(usd(t.savedUsd), sign(t.savedUsd), `saved against ${esc(view.baseline.alias)}`)}
 ${tile(pct(t.savedPct), sign(t.savedUsd), "of the native baseline")}
 ${tile(num(t.requests), "", `requests, ${num(t.priced)} reached a model`)}
-${tile(pct(t.cheaperShare), "", `served below the rung asked for, of ${num(t.comparableRequests)} pinned`)}
-${tile(usd(t.classifierUsd), "", `classifier, ${num(t.classifierCalls)} calls`)}
+${/* Merged day files pair nothing, so the team page has no pinned request to measure and drops the tile entirely. */
+    t.comparableRequests ? tile(pct(t.cheaperShare), "", `served below the rung asked for, of ${num(t.comparableRequests)} pinned`) : ""}
+${t.classifierUsd > 0 || !t.classifierCalls
+    // A merged day file carries classifier calls but no classifier tokens, so the team page counts them and prices nothing.
+    ? tile(usd(t.classifierUsd), "", `classifier, ${num(t.classifierCalls)} calls`)
+    : tile(num(t.classifierCalls), "", "classifier calls, not priced here")}
 ${tile(num(t.escalations), "", t.topEscalation ? `escalations, mostly ${esc(t.topEscalation)}` : "escalations")}
 </div>
 <div class="cols">
-  <div class="panel"><h2>What the router did</h2>
-    <table><thead><tr><th>Deciding signal</th><th class="n">Requests</th><th class="n">Cost</th></tr></thead><tbody>${reasonRows}</tbody></table></div>
-  <div class="panel"><h2>Where the money went</h2>
-    <table><thead><tr><th>Requested &rarr; routed</th><th class="n">Requests</th><th class="n">Cost</th><th class="n">Saved</th></tr></thead><tbody>${routeRows}</tbody></table></div>
+  ${panels}
 </div>
 <footer>Actual ${usd(t.costUsd)} &middot; asked-for baseline ${usd(t.requestedUsd)} (${usd(t.savedVsRequestedUsd)} saved) &middot; native baseline ${usd(t.baselineUsd)} &middot; tokens in ${num(t.inputTokens)}, out ${num(t.outputTokens)}, cache-read ${num(t.cacheReadTokens)} &middot; ${num(t.errors)} errors &middot; generated ${esc(opts.generatedAt)}</footer>
 </div>${script}</body></html>

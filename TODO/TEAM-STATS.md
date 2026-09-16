@@ -1,15 +1,22 @@
 # Feature: team stats publishing
 
-- [ ] Add an opt-in `publish` block to the config; absent means off
-- [ ] Write `dailyRollup(lines, date)` in `src/publish.ts`: pure, returns the day file
-- [ ] Resolve identity from the token with one `GET /user` call, cached for the process
-- [ ] Write the contents API PUT with 409 retry and jitter
-- [ ] Publish only closed UTC days, and only days with no file already present
-- [ ] Add `bedrouter publish [--since] [--dry-run]` and an hourly in-process check
-- [ ] Add `bedrouter rollup <dir> --prices <file> --out <dir>` for the stats repo Action
-- [ ] Add `test/publish.test.ts` over `dailyRollup()` and `mergeIndex()`, including the redaction assertions
-- [ ] Create the stats repo: `prices.json`, the workflow, the page, and a README explaining the numbers
-- [ ] Add `BEDROUTER_PUBLISH_TOKEN` to Infisical, and document the PAT scope in the README
+- [x] Add an opt-in `publish` block to the config; absent means off
+- [x] Write `dailyRollup(lines, date)` in `src/publish.ts`: pure, returns the day file
+- [x] Resolve identity from the token with one `GET /user` call, cached for the process
+- [x] Write the contents API PUT with 409 retry and jitter
+- [x] Publish only closed UTC days, and only days with no file already present
+- [x] Add `bedrouter publish [--since] [--dry-run]` and an hourly in-process check
+- [x] Add `bedrouter rollup <dir> --prices <file> --out <dir>` for the stats repo Action
+- [x] Add `test/publish.test.ts` over `dailyRollup()` and `mergeIndex()`, including the redaction assertions
+- [x] Create the stats repo: `prices.json`, the workflow, the page, and a README explaining the numbers
+      (scaffolded and committed at `../bedrouter-stats`, not pushed: creating the GitHub repository is in TODO.md)
+- [x] Document the PAT scope in the README; **adding `BEDROUTER_PUBLISH_TOKEN` to Infisical is in TODO.md**
+
+Two things the log cannot supply, both recorded in TODO.md rather than guessed:
+the classifier's token counts (the log holds cost and latency only, so a day file
+carries `classifier.calls` and the team page prices nothing for it), and a
+requested/routed pairing (the two groupings are separate, so the team page shows
+no `requested -> routed` table and a per-person table instead).
 
 Depends on the aggregation and pricing model in [PRICE-DASHBOARD.md](PRICE-DASHBOARD.md).
 The team page renders the same view model from merged data.

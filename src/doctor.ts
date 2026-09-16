@@ -16,6 +16,27 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   console.log(`config: ${process.env.BEDROUTER_CONFIG ?? "./bedrouter.json (or bedrouter.example.json)"}, routing ${cfg.routing?.enabled ? "on" : "off"}`);
   console.log(`  stack: ${cfg.stack.map((r) => `${r.alias}=${r.bedrockId}${r.enabled ? "" : " (disabled)"}`).join("  ")}`);
 
+  const { Router } = await import("./router.js");
+  const { baselineRung } = await import("./dashboard.js");
+  const router = new Router(cfg);
+  try { const b = baselineRung(router.ranked, router.rc.baselineAlias); console.log(`  dashboard baseline: ${b.alias} at $${b.inputPerM}/$${b.outputPerM} per million${router.rc.baselineAlias ? "" : " (default: dearest enabled rung that serves explore)"}`); }
+  catch (err) { console.log(`  dashboard baseline: ${(err as Error).message}`); }
+
+  const pub = cfg.publish;
+  if (!pub?.enabled || !pub.repo) console.log(`publish: off${pub ? "" : " (no publish block in the config)"}`);
+  else {
+    const { resolveCredential, identity } = await import("./publish.js");
+    const cred = resolveCredential(pub.credential ?? "auto");
+    console.log(`publish: ${pub.repo}${pub.branch ? ` (${pub.branch})` : ""}, every ${Math.round((pub.intervalMs ?? 3_600_000) / 60_000)} min`);
+    if (!cred) console.log("  credential: none. Run `gh auth login`, or set BEDROUTER_PUBLISH_TOKEN in .env");
+    else {
+      // A gh token carries whatever scope the developer already has and nothing here can narrow it, so the scope is
+      // reported rather than assumed. bedrouter only ever writes data/<login>/<date>.json.
+      try { const me = await identity(cred.token); console.log(`  credential: ${cred.source}, publishing as ${me.login} (id ${me.id})${me.scopes ? `, token scopes: ${me.scopes}` : ", fine-grained token (no scope header)"}`); }
+      catch (err) { console.log(`  credential: ${cred.source}, but GET /user failed: ${(err as Error).message}`); }
+    }
+  }
+
   if (p.ok && argv.includes("--probe")) {
     console.log("\nprobe: one 1-token request per rung");
     let denied = 0;

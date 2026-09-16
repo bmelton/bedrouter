@@ -3,7 +3,9 @@ import type { Class, RoutingConfig } from "./router.js";
 
 export type Capabilities = { transport: "bedrock-runtime"; api: "converse"; toolUse: boolean; streaming: boolean; imageInput: boolean; structuredOutputs: boolean; promptCaching: boolean; contextWindow: number; maxOutput: number };
 export type Rung = { alias: string; bedrockId: string; vendor: string; enabled: boolean; inputPerM: number; outputPerM: number; serves: Class[]; capabilities: Capabilities; auto?: boolean };
-export type Config = { stack: Rung[]; aliases?: Record<string, string>; routing?: Omit<Partial<RoutingConfig>, "shape" | "keywords" | "classifier"> & { shape?: Partial<RoutingConfig["shape"]>; keywords?: Partial<RoutingConfig["keywords"]>; classifier?: Partial<RoutingConfig["classifier"]> } };
+/** Team stats publishing. An absent block means off: nothing leaves a machine without the block being there on purpose. */
+export type PublishConfig = { enabled?: boolean; repo?: string; branch?: string; intervalMs?: number; credential?: "auto" | "gh" | "env" };
+export type Config = { stack: Rung[]; aliases?: Record<string, string>; publish?: PublishConfig; routing?: Omit<Partial<RoutingConfig>, "shape" | "keywords" | "classifier"> & { shape?: Partial<RoutingConfig["shape"]>; keywords?: Partial<RoutingConfig["keywords"]>; classifier?: Partial<RoutingConfig["classifier"]> } };
 export const DEFAULT_CONFIG_PATH = "./bedrouter.json";
 
 export function loadConfig(file = process.env.BEDROUTER_CONFIG ?? DEFAULT_CONFIG_PATH): Config {
