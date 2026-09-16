@@ -14,6 +14,7 @@ import { ClientError, converseEventToOpenai, converseToOpenai, newStreamState, o
 import { Router, ToolJsonCheck, type Class, type Decision } from "./router.js";
 import { describe, preflight } from "./preflight.js";
 import { classifyWithModel } from "./classifier.js";
+import { aggregate, baselineRung, renderHtml, type LogLine } from "./dashboard.js";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Json = any;
@@ -93,6 +94,23 @@ function appendLog(entry: LogEntry) {
 
 class HttpError extends Error {
   constructor(public status: number, message: string) { super(message); }
+}
+
+// The dashboard page makes no network request at all, and this is what stops a later edit from quietly adding one.
+const DASHBOARD_CSP = "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'";
+// ponytail: whole-file read per request, cached by mtime and size. Stream and index by day if the log passes a few hundred MB.
+let logCache: { key: string; lines: LogLine[] } | null = null;
+function readLogLines(): LogLine[] {
+  let key: string;
+  try { const st = fs.statSync(LOG_PATH); key = `${st.mtimeMs}:${st.size}`; } catch { return []; }
+  if (logCache?.key === key) return logCache.lines;
+  const lines: LogLine[] = [];
+  for (const line of fs.readFileSync(LOG_PATH, "utf8").split("\n")) {
+    if (!line) continue;
+    try { lines.push(JSON.parse(line)); } catch { /* a line torn by a concurrent append */ }
+  }
+  logCache = { key, lines };
+  return lines;
 }
 
 const anthropicErrorType = (status: number) =>
@@ -223,6 +241,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
   const classifierRung = router.rc.classifier.enabled ? table.get(router.rc.classifier.model!) : undefined;
   if (router.rc.classifier.enabled && !classifierRung) throw new Error(`routing.classifier.model "${router.rc.classifier.model}" is not a known model`);
   const aliases = () => [...table.keys()];
+  const ranks = Object.fromEntries(router.ranked.map((r, i) => [r.alias, i]));
 
   const resolve = (name: unknown): Rung => {
     const rung = resolveModel(table, name);
@@ -388,6 +407,24 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       return st ? sendJson(res, 200, st) : sendJson(res, 404, { error: { message: "unknown session" } });
     }
     if (req.method === "GET" && url.pathname === "/v1/sessions") return sendJson(res, 200, { data: [...sessions.values()].slice(-50).reverse() });
+    if (req.method === "GET" && (url.pathname === "/dashboard" || url.pathname === "/dashboard/data.json")) {
+      try {
+        const sinceParam = url.searchParams.get("since");
+        const since = sinceParam ? Date.parse(sinceParam) : 0;
+        if (sinceParam && Number.isNaN(since)) throw new HttpError(400, `since "${sinceParam}" is not a timestamp`);
+        const view = aggregate(readLogLines(), {
+          baseline: baselineRung(router.ranked, router.rc.baselineAlias), ranks, since,
+          bucket: url.searchParams.get("bucket") === "hour" ? "hour" : "day",
+          session: url.searchParams.get("session") ?? undefined,
+        });
+        if (url.pathname.endsWith(".json")) return sendJson(res, 200, view);
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": DASHBOARD_CSP, "cache-control": "no-store" });
+        return res.end(renderHtml(view, { generatedAt: `${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, live: true }));
+      } catch (err) {
+        // A broken dashboard must never look like a broken router, so it answers for itself and nothing else changes.
+        return sendJson(res, errorStatus(err), errorBody(err, "openai"));
+      }
+    }
     const handler = req.method === "POST" ? { "/v1/messages": handleMessages, "/v1/chat/completions": handleChat }[url.pathname] : undefined;
     if (!handler) return sendJson(res, 404, errorBody(new HttpError(404, `no route for ${req.method} ${url.pathname}`), shape));
 

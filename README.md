@@ -259,6 +259,62 @@ with the escalation triggers at the end of the report.
 bedrouter report --since 2026-09-13T00:00:00Z --session <key> --log ./other.jsonl --json
 ```
 
+### The two baselines
+
+Savings need a counterfactual, and one number cannot carry both stories.
+
+The **asked-for baseline** is `requestedCostUsd` above: the same tokens priced at
+the rung the client named. It is the honest number for pinned traffic. It is weak
+for `auto` traffic, because `auto` already resolves to a cheap `execute` rung, so
+the comparison starts from a low price and the reported saving is near zero.
+
+The **native baseline** prices the same tokens at one configured top rung, which
+answers "what would this have cost if every request had gone to the big model".
+Set the rung in `bedrouter.json`:
+
+```json
+"routing": { "baselineAlias": "opus" }
+```
+
+Absent that key, the baseline is the dearest enabled rung that serves `explore`,
+taken from the selection order rather than from list price. A name that no
+enabled rung answers to is an error the dashboard reports; it never changes a
+routing decision.
+
+Both figures are computed when the page renders, from the token counts each log
+line already holds. Nothing extra is written on the request path, so correcting a
+price in the config re-prices the whole history at once. Both are estimates, not
+invoices: the counterfactual holds the token counts fixed and varies only the
+price, and the same prompt on another model emits a different number of output
+tokens.
+
+### The dashboard
+
+`GET /dashboard` renders those numbers as one page: spend per day split by routed
+rung against the native baseline, the savings rate per day, six headline tiles,
+and the `by deciding signal` and `requested -> routed` tables. A route that costs
+more than the baseline shows a negative saving in a distinct colour, never a
+zero, because a router that quietly spends more is the thing the page exists to
+catch.
+
+| Route | Returns |
+| --- | --- |
+| `GET /dashboard` | The page. One self-contained document: inline SVG charts, no script, style, font or image from anywhere else. A Content-Security-Policy header enforces it |
+| `GET /dashboard/data.json` | The same view model as JSON, so the numbers can be read without parsing HTML |
+
+Both accept `since` (ISO timestamp), `bucket` (`day` by default, or `hour`), and
+`session`, matching `bedrouter report`. The page reads the log after the fact and
+makes no Bedrock call, so a broken dashboard cannot make a request fail.
+
+```sh
+bedrouter report --html spend.html --bucket hour     # the same page, written to disk
+```
+
+The snapshot is meant to be sent to somebody, so the view model carries
+aggregates only: counts, tokens, dollars, model aliases, and signal names.
+`classifierNote` is free text a model wrote about a prompt and can therefore
+quote one, so `aggregate()` drops it rather than the renderer hiding it.
+
 ## Logs
 
 Every request appends one JSON line to `BEDROUTER_LOG` (default

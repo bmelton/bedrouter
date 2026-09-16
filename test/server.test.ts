@@ -71,3 +71,29 @@ test("a rung denied for every eligible class surfaces the error instead of loopi
 });
 
 test("a capability ValidationException re-picks inside the same request and records the contradiction",async()=>{const ids:string[]=[];await run(cfg,async c=>{ids.push(c.input.modelId);if(ids.length===1)throw Object.assign(new Error("tool use is not supported"),{name:"ValidationException",$metadata:{httpStatusCode:400}});return reply},async base=>{const out=await post(base,"/v1/chat/completions",{model:"auto",messages:[{role:"user",content:"implement it"}]});assert.equal(out.r.status,200);assert.deepEqual(ids,["w","d"]);const log=JSON.parse(fs.readFileSync(process.env.BEDROUTER_LOG!,"utf8").trim().split("\n").at(-1)!);assert.equal(log.vendor,"anthropic");assert.ok(log.skipped.some((x:string)=>x.includes("validation-contradiction")))})});
+
+test("the dashboard serves the same view model as the page, and is not on the request path",async()=>{
+ await run(cfg,async()=>reply,async base=>{
+  await post(base,"/v1/chat/completions",{model:"auto",messages:[{role:"user",content:"implement it"}]});
+  const data=await(await fetch(base+"/dashboard/data.json")).json();
+  // No baselineAlias is configured above, so the dearest enabled rung that serves explore stands in for "no router".
+  assert.equal(data.baseline.alias,"deep");
+  assert.ok(data.totals.requests>0);
+  assert.ok(!JSON.stringify(data).includes("classifierNote"));
+  const page=await fetch(base+"/dashboard");
+  assert.equal(page.headers.get("content-type"),"text/html; charset=utf-8");
+  assert.match(page.headers.get("content-security-policy")??"",/default-src 'none'/);
+  assert.match(await page.text(),/<svg/);
+  const bad=await fetch(base+"/dashboard?since=not-a-time");
+  assert.equal(bad.status,400,"a bad parameter answers for itself and leaves the router alone");
+ });
+});
+
+test("a baselineAlias naming a rung that is not in the stack fails the dashboard, not the router",async()=>{
+ await run({...cfg,routing:{...cfg.routing,baselineAlias:"ghost"}},async()=>reply,async base=>{
+  assert.equal((await post(base,"/v1/chat/completions",{model:"auto",messages:[{role:"user",content:"hi"}]})).r.status,200);
+  const out=await fetch(base+"/dashboard/data.json");
+  assert.equal(out.status,502);
+  assert.match(JSON.stringify(await out.json()),/not a rung in the stack/);
+ });
+});

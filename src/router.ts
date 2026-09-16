@@ -2,8 +2,10 @@ import { createHash } from "node:crypto";
 import type { Config, Rung } from "./config.js";
 type Json = any;
 export type Class = "trivial" | "execute" | "explore";
-export type RoutingConfig = { enabled:boolean; honorClientModel:boolean; trivialBelowFloor:boolean; upgradeOnIntent:boolean; classifier:{enabled:boolean;model:string|null;mode:"fallback"|"always";maxChars:number;timeoutMs:number}; maxConversations:number;retryWindowMs:number;cacheHitRate:number;injectedMarkers:string[];shape:{exploreInputTokens:number;exploreTools:number;executeTurns:number;executeLastUserChars:number;trivialMaxChars:number;trivialMaxInputTokens:number;humanTurnMaxChars:number};keywords:Record<"execute"|"explore",string[]> };
-export const ROUTING_DEFAULTS:RoutingConfig={enabled:false,honorClientModel:true,trivialBelowFloor:true,upgradeOnIntent:true,classifier:{enabled:false,model:null,mode:"fallback",maxChars:4000,timeoutMs:4000},maxConversations:1000,retryWindowMs:60000,cacheHitRate:.8,
+export type RoutingConfig = { enabled:boolean; honorClientModel:boolean; trivialBelowFloor:boolean; upgradeOnIntent:boolean; classifier:{enabled:boolean;model:string|null;mode:"fallback"|"always";maxChars:number;timeoutMs:number}; maxConversations:number;retryWindowMs:number;cacheHitRate:number;
+ /** The rung the dashboard prices the "no router" counterfactual at. Null takes the dearest enabled rung that serves explore. */
+ baselineAlias:string|null;injectedMarkers:string[];shape:{exploreInputTokens:number;exploreTools:number;executeTurns:number;executeLastUserChars:number;trivialMaxChars:number;trivialMaxInputTokens:number;humanTurnMaxChars:number};keywords:Record<"execute"|"explore",string[]> };
+export const ROUTING_DEFAULTS:RoutingConfig={enabled:false,honorClientModel:true,trivialBelowFloor:true,upgradeOnIntent:true,classifier:{enabled:false,model:null,mode:"fallback",maxChars:4000,timeoutMs:4000},maxConversations:1000,retryWindowMs:60000,cacheHitRate:.8,baselineAlias:null,
  // ponytail: prefix match against a marker list, not a parser. U+2063 is firstmate's invisible machine prefix; add a
  // marker per harness. The size cap is the backstop for harnesses that inject without marking.
  injectedMarkers:["⁣"],shape:{exploreInputTokens:60000,exploreTools:40,executeTurns:8,executeLastUserChars:200,trivialMaxChars:300,trivialMaxInputTokens:1500,humanTurnMaxChars:4000},keywords:{explore:[],execute:[]}};

@@ -1,9 +1,13 @@
 import "./env.js";
 import fs from "node:fs";
+import { loadConfig } from "./config.js";
+import { Router } from "./router.js";
+import { aggregate, baselineRung, renderHtml } from "./dashboard.js";
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   // Savings report over the decision log: what routing cost versus what the same usage would have cost on the model each
   // client asked for. Usage: npm run report [-- --log path] [--json] [--since 2026-09-14T00:00:00Z] [--session key]
+  //   [--html out.html] [--bucket day|hour]   the dashboard page, written to disk as a shareable snapshot
 
   type Line = { ts: string; classifierCostUsd?: number | null; classifierMs?: number | null; class: string | null; classReason: string | null; requestedModel: string | null; routedModel: string | null; costUsd: number | null; requestedCostUsd: number | null; inputTokens: number | null; outputTokens: number | null; cacheReadTokens: number | null; latencyMs: number; error: string | null; escalated: boolean; escalationReason: string | null; conversationKey: string | null; sessionKey?: string | null; endpoint: string };
 
@@ -17,6 +21,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   if (!fs.existsSync(logPath)) { console.error(`no log at ${logPath}`); return 1; }
   const lines: Line[] = fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((l: Line) => Date.parse(l.ts) >= since && (!session || l.sessionKey === session));
   const priced = lines.filter((l) => l.costUsd != null);
+
+  const htmlOut = opt("html");
+  if (htmlOut) {
+    // The same renderer the server route uses, so a snapshot and the live page cannot disagree. It has no refresh
+    // control, because there is no server behind a file on disk.
+    const router = new Router(loadConfig());
+    const view = aggregate(lines, {
+      baseline: baselineRung(router.ranked, router.rc.baselineAlias),
+      ranks: Object.fromEntries(router.ranked.map((r, i) => [r.alias, i])),
+      bucket: opt("bucket") === "hour" ? "hour" : "day",
+    });
+    fs.writeFileSync(htmlOut, renderHtml(view, { generatedAt: `${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, live: false }));
+    console.log(`wrote ${htmlOut}  (${view.totals.requests} requests, baseline ${view.baseline.alias}, saved ${view.totals.savedUsd.toFixed(4)})`);
+    return 0;
+  }
 
   type Agg = { requests: number; costUsd: number; requestedCostUsd: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; escalations: number; latencyMs: number };
   const agg = (): Agg => ({ requests: 0, costUsd: 0, requestedCostUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, escalations: 0, latencyMs: 0 });
