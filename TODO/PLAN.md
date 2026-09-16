@@ -10,16 +10,21 @@
 > repository's own `TODO/PLAN.md` gets one line pointing here.
 
 - [x] **Wave 1** [PRICE-DASHBOARD.md](PRICE-DASHBOARD.md) (9 items, bedrouter only, ships as 0.7.0)
-- [ ] **Wave 2a** [TEAM-STATS.md](TEAM-STATS.md) (11 items, bedrouter plus a new stats repository, ships as 0.8.0)
-- [ ] **Wave 2b** HABLO-installer: render the `publish` block, no user input for shared values (8 items, below)
+- [x] **Wave 2a** [TEAM-STATS.md](TEAM-STATS.md) (11 items, bedrouter plus a new stats repository, ships as 0.8.0)
+- [x] **Wave 2b** HABLO-installer: render the `publish` block, no user input for shared values (9 items, below)
 - [ ] **Wave 3** [LOCAL-CODEX.md](LOCAL-CODEX.md) (13 items, gated on two spikes that start now)
-- [ ] Plan-owned: the credential resolver, `bedrouter doctor` reporting it (below)
-- [ ] Plan-owned: `prices.json` drift check in `rollup` (below)
-- [ ] Plan-owned: `modelId` accepted beside `bedrockId` for one minor version (below)
-- [ ] Plan-owned: `Taskfile.yml` with a `secrets` task (below)
+- [x] Plan-owned: the credential resolver, `bedrouter doctor` reporting it (below)
+- [x] Plan-owned: `prices.json` drift check in `rollup` (below)
+- [ ] Plan-owned: `modelId` accepted beside `bedrockId` for one minor version (below, lands with wave 3)
+- [x] Plan-owned: `Taskfile.yml` with a `secrets` task (below)
 
 33 feature items plus 4 plan-owned decisions. The count is the only size signal
 here. It is not an estimate of time.
+
+> Waves 1, 2a and 2b are code-complete on branch `feat/dashboard-and-team-stats`
+> (and `feat/team-stats-publish` in HABLO-installer), with 37 bedrouter tests and
+> 3 installer tests passing. Nothing is pushed and nothing is published.
+> [TODO.md](TODO.md) holds every remaining action that needs a person.
 
 ## The shape of it
 
@@ -151,14 +156,15 @@ values are resolved on the machine.
 from `BEDROUTER_PUBLISH_TOKEN` in `~/.bedrouter/.env`. This is the same split
 `jira.envSource` already makes, and it needs no new mechanism.
 
-- [ ] Add `bedrouter.publish` and `bedrouter.routing.baselineAlias` to `hablo.json`
-- [ ] Step 4: render both into `~/.bedrouter/bedrouter.json` from the manifest
-- [ ] Step 4: print what leaves the machine, to which repository, and the flag that turns it off
-- [ ] Add `--skip-publish` and `--publish-repo <owner/name>` to `install.mjs`
-- [ ] Add `--publish-cred gh|env|auto` so an unattended run answers the credential question
-- [ ] When stdin is a TTY, `gh` is authenticated, and `--publish-cred` is absent: ask once, then record the answer in `bedrouter.json`
-- [ ] Step 4: report the resolved credential source, or say that publishing is configured but has no credential yet
-- [ ] README: one options-table row per new flag, and the shared-versus-personal split in prose
+- [x] Add `bedrouter.publish` and `bedrouter.routing.baselineAlias` to `hablo.json`
+- [x] Step 4: render both into `~/.bedrouter/bedrouter.json` from the manifest
+- [x] Step 4: print what leaves the machine, to which repository, and the flag that turns it off
+- [x] Add `--skip-publish` and `--publish-repo <owner/name>` to `install.mjs`
+- [x] Add `--publish-cred gh|env|auto` so an unattended run answers the credential question
+- [x] When stdin is a TTY, `gh` is authenticated, and `--publish-cred` is absent: ask once, then record the answer in `bedrouter.json`
+- [x] Step 4: report the resolved credential source, or say that publishing is configured but has no credential yet
+- [x] README: one options-table row per new flag, and the shared-versus-personal split in prose
+- [x] Three tests in `test/install.test.mjs`: off by default, rendered when named, never asked when unattended
 
 A non-interactive run never blocks. With no TTY and no flag, the installer takes
 `auto`, prints the source it found, and continues.
