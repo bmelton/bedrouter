@@ -43,7 +43,7 @@ export async function classifyWithModel(client: Pick<BedrockRuntimeClient, "send
   const timer = setTimeout(() => ac.abort(), opts.timeoutMs);
   try {
     const out = await client.send(new ConverseCommand({
-      modelId: rung.bedrockId,
+      modelId: rung.modelId,
       system: [{ text: CLASSIFIER_SYSTEM }],
       messages: [{ role: "user", content: [{ text: classifierPrompt(body, opts.maxChars) }] }],
       inferenceConfig: { maxTokens: 60, temperature: 0 },

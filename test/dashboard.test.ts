@@ -5,7 +5,7 @@ import type { Rung } from "../src/config.js";
 
 const cap = { transport: "bedrock-runtime" as const, api: "converse" as const, toolUse: true, streaming: true, imageInput: false, structuredOutputs: true, promptCaching: false, contextWindow: 1000, maxOutput: 100 };
 const rung = (alias: string, inputPerM: number, serves: Rung["serves"], enabled = true): Rung =>
-  ({ alias, vendor: "v", serves, enabled, bedrockId: alias, inputPerM, outputPerM: inputPerM * 4, capabilities: cap });
+  ({ alias, vendor: "v", serves, enabled, modelId: alias, inputPerM, outputPerM: inputPerM * 4, capabilities: cap });
 // Cheapest first, as Router.ranked would order it.
 const ranked = [rung("cheap", 0.1, ["trivial", "execute"]), rung("mid", 1, ["execute", "explore"]), rung("big", 10, ["explore"]), rung("off", 99, ["explore"], false)];
 const ranks = Object.fromEntries(ranked.map((r, i) => [r.alias, i]));

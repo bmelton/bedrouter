@@ -9,9 +9,9 @@ process.env.BEDROUTER_LOG=path.join(fs.mkdtempSync(path.join(os.tmpdir(),"bedrou
 const {createServer}=await import("../src/server.js");
 const cap={transport:"bedrock-runtime" as const,api:"converse" as const,toolUse:true,streaming:true,imageInput:false,structuredOutputs:true,promptCaching:false,contextWindow:200000,maxOutput:64000};
 const cfg:Config={stack:[
- {alias:"tiny",bedrockId:"t",vendor:"amazon",enabled:true,inputPerM:.1,outputPerM:.2,serves:["trivial"],capabilities:{...cap,promptCaching:true}},
- {alias:"work",bedrockId:"w",vendor:"openai",enabled:true,inputPerM:.2,outputPerM:.4,serves:["execute"],capabilities:cap},
- {alias:"deep",bedrockId:"d",vendor:"anthropic",enabled:true,inputPerM:1,outputPerM:5,serves:["execute","explore"],capabilities:{...cap,promptCaching:true,imageInput:true}}
+ {alias:"tiny",modelId:"t",vendor:"amazon",enabled:true,inputPerM:.1,outputPerM:.2,serves:["trivial"],capabilities:{...cap,promptCaching:true}},
+ {alias:"work",modelId:"w",vendor:"openai",enabled:true,inputPerM:.2,outputPerM:.4,serves:["execute"],capabilities:cap},
+ {alias:"deep",modelId:"d",vendor:"anthropic",enabled:true,inputPerM:1,outputPerM:5,serves:["execute","explore"],capabilities:{...cap,promptCaching:true,imageInput:true}}
 ],routing:{enabled:true,keywords:{explore:["design"],execute:["implement"]},classifier:{enabled:false}}};
 const reply={output:{message:{role:"assistant",content:[{text:"hi"}]}},stopReason:"end_turn",usage:{inputTokens:10,outputTokens:5}};
 const anthropic={body:Buffer.from(JSON.stringify({content:[{type:"text",text:"hi"}],stop_reason:"end_turn",usage:{input_tokens:10,output_tokens:5}}))};
@@ -25,7 +25,7 @@ test("auto uses chat/Converse, exposes stack metadata, and strips cache points o
 test("the output cap is read from either OpenAI field, never steers selection, and is clamped per rung",async()=>{
  // a dearer rung that could deliver the full 128k must NOT be preferred: clients send a defensive ceiling, not a
  // requirement, so honouring it would silently buy capacity almost no turn uses
- const big={...cfg.stack[1],alias:"big",bedrockId:"b",inputPerM:9,capabilities:{...cap,maxOutput:128000}};
+ const big={...cfg.stack[1],alias:"big",modelId:"b",inputPerM:9,capabilities:{...cap,maxOutput:128000}};
  const picked:string[]=[];
  await run({...cfg,stack:[...cfg.stack,big]},async c=>{picked.push(c.input.modelId);return reply},async base=>{
   assert.equal((await post(base,"/v1/chat/completions",{model:"auto",max_completion_tokens:128000,messages:[{role:"user",content:"implement it"}]})).r.status,200);

@@ -14,7 +14,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   console.log(describe(p, region));
   const cfg = loadConfig();
   console.log(`config: ${process.env.BEDROUTER_CONFIG ?? "./bedrouter.json (or bedrouter.example.json)"}, routing ${cfg.routing?.enabled ? "on" : "off"}`);
-  console.log(`  stack: ${cfg.stack.map((r) => `${r.alias}=${r.bedrockId}${r.enabled ? "" : " (disabled)"}`).join("  ")}`);
+  console.log(`  stack: ${cfg.stack.map((r) => `${r.alias}=${r.modelId}${r.enabled ? "" : " (disabled)"}`).join("  ")}`);
 
   const { Router } = await import("./router.js");
   const { baselineRung } = await import("./dashboard.js");
@@ -43,12 +43,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     for (const r of cfg.stack.filter((r) => r.enabled)) {
       const started = Date.now();
       try {
-        await client.send(new ConverseCommand({ modelId: r.bedrockId, messages: [{ role: "user", content: [{ text: "hi" }] }], inferenceConfig: { maxTokens: 1 } }));
-        console.log(`  ok      ${r.alias.padEnd(14)} ${r.bedrockId}  (${Date.now() - started} ms)`);
+        await client.send(new ConverseCommand({ modelId: r.modelId, messages: [{ role: "user", content: [{ text: "hi" }] }], inferenceConfig: { maxTokens: 1 } }));
+        console.log(`  ok      ${r.alias.padEnd(14)} ${r.modelId}  (${Date.now() - started} ms)`);
       } catch (err) {
         const e = err as { name?: string; message?: string };
         const why = /not available for this account/i.test(e.message ?? "") ? "not available for this account (Bedrock entitlement, not IAM)" : e.message;
-        console.log(`  DENIED  ${r.alias.padEnd(14)} ${r.bedrockId}  ${e.name}: ${why}`);
+        console.log(`  DENIED  ${r.alias.padEnd(14)} ${r.modelId}  ${e.name}: ${why}`);
         denied++;
       }
     }

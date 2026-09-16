@@ -265,7 +265,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       // on error/unparseable the rules' decision stands; the note in the log says why
     }
     Object.assign(log, {
-      clientModel: body.model, bedrockId: d.rung.bedrockId, vendor: d.rung.vendor, stream: !!body.stream,
+      clientModel: body.model, bedrockId: d.rung.modelId, vendor: d.rung.vendor, stream: !!body.stream,
       class: d.class, classReason: d.classReason, conversationKey: d.conversationKey, requestedModel: requested.alias, routedModel: d.rung.alias, sticky: d.sticky,
       eligibleCount: d.eligibleCount, skipped: d.skipped, degraded: d.degraded,
     });
@@ -274,7 +274,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       const note = log.classifierNote != null ? `  classifier: "${log.classifierNote}" ${log.classifierMs} ms ${usd(log.classifierCostUsd)}` : "";
       const arrow = d.rung.alias === requested.alias ? "=" : "≠";
       debug(`  routed  ${requested.alias}${requested.auto ? " (auto)" : ""} ${arrow}> ${d.rung.alias}  ${via}${d.escalationReason ? `  escalation:${d.escalationReason}` : ""}  conv=${d.conversationKey ?? "-"}${note}`);
-      debug(`          ${d.rung.bedrockId}`);
+      debug(`          ${d.rung.modelId}`);
     }
     return d.rung;
   };
@@ -291,7 +291,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     payload.anthropic_version ??= "bedrock-2023-05-31";
     const betas = String(req.headers["anthropic-beta"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
     if (betas.length) payload.anthropic_beta = [...new Set([...(payload.anthropic_beta ?? []), ...betas])];
-    const cmd = { modelId: rung.bedrockId, contentType: "application/json", accept: "application/json", body: JSON.stringify(payload) };
+    const cmd = { modelId: rung.modelId, contentType: "application/json", accept: "application/json", body: JSON.stringify(payload) };
     const usage: Usage = { input: 0, output: 0 };
     const takeUsage = (u: Json) => {
       if (!u) return;
@@ -339,7 +339,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       let rung = await route(req, body, log, rt);
       for (let tries = 0; ; tries++) {
         const routedBody = forRung(rt.decision?.degraded.length ? stripCachePoints(body) : body, rung);
-        try { return { out: await send(openaiToConverse(routedBody, rung.bedrockId)), rung }; }
+        try { return { out: await send(openaiToConverse(routedBody, rung.modelId)), rung }; }
         catch (err) {
           const fatal = unavailableModel(err) ? "unavailable" : capabilityValidation(err) ? "validation-contradiction" : null;
           if (!fatal || !rt.decision || tries >= MAX_REROUTES) throw err;
@@ -393,7 +393,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     const shape = url.pathname === "/v1/messages" ? "anthropic" : "openai";
     if (req.method === "GET" && url.pathname === "/health") return sendJson(res, 200, { ok: true, region, pid: process.pid, version: VERSION, routing: router.rc.enabled, classifier: router.rc.classifier.enabled ? router.rc.classifier.model : null, uptimeS: Math.round(process.uptime()) });
     if (req.method === "GET" && url.pathname === "/v1/models") {
-      const data = [...table.entries()].map(([id, r]) => ({ id, object: "model", created: 0, owned_by: r.vendor, bedrock_id: r.bedrockId,
+      const data = [...table.entries()].map(([id, r]) => ({ id, object: "model", created: 0, owned_by: r.vendor, bedrock_id: r.modelId,
         bedrouter: { vendor: r.vendor, rung: r.alias, auto: !!r.auto, enabled: r.enabled, serves: r.serves, capabilities: r.capabilities, inputPerM: r.inputPerM, outputPerM: r.outputPerM } }));
       return sendJson(res, 200, { object: "list", data });
     }

@@ -4,7 +4,7 @@ import { Router, ToolJsonCheck } from "../src/router.js";
 import { modelTable, resolveModel, type Config, type Rung } from "../src/config.js";
 
 const caps = (patch = {}) => ({ transport: "bedrock-runtime" as const, api: "converse" as const, toolUse: true, streaming: true, imageInput: false, structuredOutputs: true, promptCaching: false, contextWindow: 10000, maxOutput: 1000, ...patch });
-const rr = (alias:string,vendor:string,serves:Rung["serves"],patch:Partial<Rung>={}):Rung=>({alias,vendor,serves,enabled:true,bedrockId:alias,inputPerM:1,outputPerM:2,capabilities:caps(),...patch});
+const rr = (alias:string,vendor:string,serves:Rung["serves"],patch:Partial<Rung>={}):Rung=>({alias,vendor,serves,enabled:true,modelId:alias,inputPerM:1,outputPerM:2,capabilities:caps(),...patch});
 const cfg:Config={stack:[rr("tiny","a",["trivial"]),rr("work-a","a",["execute"]),rr("work-b","b",["execute"]),rr("deep-b","b",["execute","explore"]),rr("deep-a","a",["explore"],{capabilities:caps({promptCaching:true,imageInput:true})})],routing:{enabled:true,keywords:{explore:["design"],execute:["implement"]},retryWindowMs:-1}};
 const table=modelTable(cfg),model=(id:string)=>resolveModel(table,id)!;
 const msg=(text:string,extra={})=>({model:"auto",messages:[{role:"user",content:text}],...extra});
