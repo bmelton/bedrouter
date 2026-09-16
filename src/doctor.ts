@@ -53,7 +53,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   if (p.ok && argv.includes("--probe")) {
     console.log("\nprobe: one 1-token request per rung");
     let denied = 0;
-    for (const r of cfg.stack.filter((r) => r.enabled)) {
+    // A rung on another provider has no Bedrock entitlement to probe, and a Converse call for it would fail in a way
+    // that reads as "not entitled" and would wrongly disable it.
+    for (const r of cfg.stack.filter((r) => r.enabled && r.capabilities.transport === "bedrock-runtime")) {
       const started = Date.now();
       try {
         await client.send(new ConverseCommand({ modelId: r.modelId, messages: [{ role: "user", content: [{ text: "hi" }] }], inferenceConfig: { maxTokens: 1 } }));
