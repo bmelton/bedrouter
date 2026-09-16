@@ -1,8 +1,13 @@
 import fs from "node:fs";
 import type { Class, RoutingConfig } from "./router.js";
 
-export type Capabilities = { transport: "bedrock-runtime"; api: "converse"; toolUse: boolean; streaming: boolean; imageInput: boolean; structuredOutputs: boolean; promptCaching: boolean; contextWindow: number; maxOutput: number };
-export type Rung = { alias: string; modelId: string; vendor: string; enabled: boolean; inputPerM: number; outputPerM: number; serves: Class[]; capabilities: Capabilities; auto?: boolean };
+export type Capabilities = { transport: "bedrock-runtime" | "openai-responses"; api: "converse" | "responses"; toolUse: boolean; streaming: boolean; imageInput: boolean; structuredOutputs: boolean; promptCaching: boolean; contextWindow: number; maxOutput: number };
+/**
+ * How a rung's credential is obtained. A table with two entries, not a plugin system: a third kind is added when a
+ * provider needs one. `aws-default-chain` is the SDK default chain and nothing else, as AGENTS.md requires.
+ */
+export type Auth = { kind: "aws-default-chain" } | { kind: "oauth-file"; path?: string };
+export type Rung = { alias: string; modelId: string; vendor: string; enabled: boolean; inputPerM: number; outputPerM: number; serves: Class[]; capabilities: Capabilities; auth?: Auth; auto?: boolean };
 /** Team stats publishing. An absent block means off: nothing leaves a machine without the block being there on purpose. */
 export type PublishConfig = { enabled?: boolean; repo?: string; branch?: string; intervalMs?: number; credential?: "auto" | "gh" | "env" };
 export type Config = { stack: Rung[]; aliases?: Record<string, string>; publish?: PublishConfig; routing?: Omit<Partial<RoutingConfig>, "shape" | "keywords" | "classifier"> & { shape?: Partial<RoutingConfig["shape"]>; keywords?: Partial<RoutingConfig["keywords"]>; classifier?: Partial<RoutingConfig["classifier"]> } };

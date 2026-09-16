@@ -15,6 +15,7 @@ import { Router, ToolJsonCheck, type Class, type Decision } from "./router.js";
 import { describe, preflight } from "./preflight.js";
 import { classifyWithModel } from "./classifier.js";
 import { aggregate, baselineRung, renderHtml, type LogLine } from "./dashboard.js";
+import { CodexError, collectChunks, newResponsesState, responsesEventToOpenai, sendCodex, type Quota } from "./codex.js";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Json = any;
@@ -61,10 +62,19 @@ export type LogEntry = {
   classifierMs: number | null;
   classifierCostUsd: number | null;
   sessionKey: string | null; // client-supplied x-bedrouter-session (pi-bedrouter sends Pi's session id); null when absent
+  // A free rung is a different unit, not a cheap one: inputPerM 0 is right for ranking and wrong for reporting, so
+  // tokens are tallied per provider beside the dollar estimate and the allocation is recorded where it is known.
+  provider: string | null;
+  quotaPercent: number | null;
 };
+/** Which pool paid for the turn. Derived from the transport, so a new provider needs no new field. */
+export const providerOf = (rung: Rung): string => (rung.capabilities.transport === "openai-responses" ? "codex" : "bedrock");
 
 /** Running totals per conversation, served on GET /v1/conversations/:key for UI integrations (pi-bedrouter's footer). */
-export type ConversationStats = { key: string; requests: number; costUsd: number; requestedCostUsd: number; classifierCostUsd: number; inputTokens: number; outputTokens: number; escalations: number; class: Class | null; routedModel: string | null; requestedModel: string | null; lastTs: string };
+export type ProviderUsage = { requests: number; inputTokens: number; outputTokens: number };
+export type ConversationStats = { key: string; requests: number; costUsd: number; requestedCostUsd: number; classifierCostUsd: number; inputTokens: number; outputTokens: number; escalations: number; class: Class | null; routedModel: string | null; requestedModel: string | null; lastTs: string;
+  /** Tokens per provider. A prepaid rung costs $0.00 and still spends an allocation, so dollars alone hide it. */
+  byProvider: Record<string, ProviderUsage> };
 /**
  * Running totals per client session, served on GET /v1/sessions/:key. A session is whatever the client says it is via the
  * `x-bedrouter-session` request header (pi-bedrouter sends Pi's session id), so unlike a conversation it survives
@@ -151,6 +161,7 @@ function decisionHeaders(log: LogEntry): Record<string, string> {
   if (log.class) h["x-bedrouter-class"] = log.class;
   if (log.classReason) h["x-bedrouter-reason"] = log.classReason;
   if (log.conversationKey) h["x-bedrouter-conversation"] = log.conversationKey;
+  if (log.provider) h["x-bedrouter-provider"] = log.provider;
   if (log.classifierNote != null) h["x-bedrouter-classifier"] = log.classifierNote.replace(/[^\x20-\x7e]/g, "?").slice(0, 200);
   return h;
 }
@@ -173,10 +184,21 @@ function checkAuth(req: http.IncomingMessage) {
   if (got !== want) throw new HttpError(401, "invalid api key");
 }
 
-/** Bedrock rejects an output cap above the model's own limit, so bring the client's ceiling down to what this rung allows. */
+/**
+ * Fit the client's output cap to what the rung can accept. Three behaviours, not two:
+ *   - Bedrock rejects a cap above the model's own limit, so the ceiling is clamped down.
+ *   - The Codex Responses endpoint rejects the parameter outright, so the cap is dropped. It cannot be expressed,
+ *     and sending it fails the whole request; server.ts records `drop-maxTokens` so the log says the ceiling was lost.
+ */
 export function forRung(body: Json, rung: Rung): Json {
-  const want = Router.maxTokens(body), limit = rung.capabilities.maxOutput;
-  if (!want || want <= limit) return body;
+  const want = Router.maxTokens(body);
+  if (!want) return body;
+  if (rung.capabilities.transport === "openai-responses") {
+    const { max_tokens: _mt, max_completion_tokens: _mct, ...rest } = body;
+    return rest;
+  }
+  const limit = rung.capabilities.maxOutput;
+  if (want <= limit) return body;
   const out = { ...body };
   if (out.max_completion_tokens != null) out.max_completion_tokens = limit;
   if (out.max_tokens != null) out.max_tokens = limit;
@@ -204,7 +226,8 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
   const tally = (log: LogEntry) => {
     if (!log.conversationKey) return;
     let c = conversations.get(log.conversationKey);
-    if (!c) { c = { key: log.conversationKey, requests: 0, costUsd: 0, requestedCostUsd: 0, classifierCostUsd: 0, inputTokens: 0, outputTokens: 0, escalations: 0, class: null, routedModel: null, requestedModel: null, lastTs: log.ts }; }
+    if (!c) { c = { key: log.conversationKey, requests: 0, costUsd: 0, requestedCostUsd: 0, classifierCostUsd: 0, inputTokens: 0, outputTokens: 0, escalations: 0, class: null, routedModel: null, requestedModel: null, lastTs: log.ts, byProvider: {} }; }
+    if (log.provider) { const p = (c.byProvider[log.provider] ??= { requests: 0, inputTokens: 0, outputTokens: 0 }); p.requests++; p.inputTokens += log.inputTokens ?? 0; p.outputTokens += log.outputTokens ?? 0; }
     c.requests++; c.costUsd += log.costUsd ?? 0; c.requestedCostUsd += log.requestedCostUsd ?? log.costUsd ?? 0; c.classifierCostUsd += log.classifierCostUsd ?? 0;
     c.inputTokens += log.inputTokens ?? 0; c.outputTokens += log.outputTokens ?? 0; c.escalations += log.escalated ? 1 : 0;
     c.class = log.class; c.routedModel = log.routedModel; c.requestedModel = log.requestedModel; c.lastTs = log.ts;
@@ -265,7 +288,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       // on error/unparseable the rules' decision stands; the note in the log says why
     }
     Object.assign(log, {
-      clientModel: body.model, bedrockId: d.rung.modelId, vendor: d.rung.vendor, stream: !!body.stream,
+      clientModel: body.model, bedrockId: d.rung.modelId, vendor: d.rung.vendor, stream: !!body.stream, provider: providerOf(d.rung),
       class: d.class, classReason: d.classReason, conversationKey: d.conversationKey, requestedModel: requested.alias, routedModel: d.rung.alias, sticky: d.sticky,
       eligibleCount: d.eligibleCount, skipped: d.skipped, degraded: d.degraded,
     });
@@ -335,39 +358,81 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     const names = toolNameMap(body);
 
     /** Send, and when the chosen rung itself is the problem, drop it and reselect. Returns the rung that answered. */
-    const sendRouted = async <T>(send: (input: Json) => Promise<T>): Promise<{ out: T; rung: Rung }> => {
+    const sendRouted = async <T>(send: (routedBody: Json, rung: Rung) => Promise<T>): Promise<{ out: T; rung: Rung }> => {
       let rung = await route(req, body, log, rt);
       for (let tries = 0; ; tries++) {
         const routedBody = forRung(rt.decision?.degraded.length ? stripCachePoints(body) : body, rung);
-        try { return { out: await send(openaiToConverse(routedBody, rung.modelId)), rung }; }
+        try { return { out: await send(routedBody, rung), rung }; }
         catch (err) {
-          const fatal = unavailableModel(err) ? "unavailable" : capabilityValidation(err) ? "validation-contradiction" : null;
+          // Codex states its own verdict and how long it lasts; Bedrock's is inferred from the exception and is
+          // permanent, because an entitlement is a fact about (account, region, rung) rather than about a moment.
+          const fault = err instanceof CodexError ? err.fault : null;
+          const fatal = fault ? (fault.kind === "capability" ? "validation-contradiction" : "unavailable")
+            : unavailableModel(err) ? "unavailable" : capabilityValidation(err) ? "validation-contradiction" : null;
           if (!fatal || !rt.decision || tries >= MAX_REROUTES) throw err;
           const rejected = rung.alias;
-          if (fatal === "unavailable") router.markUnavailable(rejected);
+          if (fatal === "unavailable") router.markUnavailable(rejected, fault ? fault.untilMs : Infinity);
           else if (!router.invalidate(rt.decision, body)) throw err;
-          // nothing left to reselect: Bedrock's own verdict is more useful than "no eligible rung"
+          // nothing left to reselect: the provider's own verdict is more useful than "no eligible rung"
           try { rung = await route(req, body, log, rt); } catch { throw err; }
           // after the reroute, which replaces log.skipped wholesale. A learned denial needs no note: eligible() reports it.
           if (fatal !== "unavailable") log.skipped.push(`${rejected}:${fatal}`);
         }
       }
     };
+
+    const isCodex = (r: Rung) => r.capabilities.transport === "openai-responses";
+    /** A spent allocation is visible before it bites, so the rung stands down rather than failing the next request. */
+    const noteQuota = (rung: Rung, q: Quota | null) => {
+      if (!q) return;
+      log.quotaPercent = q.usedPercent;
+      if (q.usedPercent < router.rc.quotaStandDownPercent) return;
+      const until = Date.now() + Math.max(q.resetAfterS, 60) * 1000;
+      router.markUnavailable(rung.alias, until);
+      debug(`  quota   ${rung.alias} at ${q.usedPercent}% of its ${q.window} window, standing down until ${new Date(until).toISOString()}`);
+    };
     const id = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     const usageOf = (u: Json): Usage => ({ input: u?.inputTokens ?? 0, output: u?.outputTokens ?? 0, cacheRead: u?.cacheReadInputTokens, cacheWrite: u?.cacheWriteInputTokens });
 
     if (!body.stream) {
-      const { out, rung } = await sendRouted((input) => client.send(new ConverseCommand(input), { abortSignal: ac.signal }));
-      log.stopReason = out.stopReason ?? null;
-      finishUsage(log, rung, usageOf(out.usage), rt);
+      // Both transports normalise to one shape here, because the Codex endpoint refuses `stream: false` and its
+      // answer has to be assembled from the stream it insists on sending.
+      const { out, rung } = await sendRouted(async (b, r) => {
+        if (isCodex(r)) {
+          const st = newResponsesState(body.model, id);
+          const turn = await sendCodex(r, b, ac.signal);
+          const chunks: Json[] = [];
+          for await (const ev of turn.events) chunks.push(...responsesEventToOpenai(st, ev));
+          noteQuota(r, turn.quota);
+          return { openai: collectChunks(chunks, st), usage: st.usage ?? { input: 0, output: 0 }, stopReason: st.stopReason ?? null };
+        }
+        const o = await client.send(new ConverseCommand(openaiToConverse(b, r.modelId)), { abortSignal: ac.signal });
+        return { openai: converseToOpenai(o, body.model, id, names), usage: usageOf(o.usage), stopReason: o.stopReason ?? null };
+      });
+      log.stopReason = out.stopReason;
+      finishUsage(log, rung, out.usage, rt);
       for (const [k, v] of Object.entries(decisionHeaders(log))) res.setHeader(k, v);
-      return sendJson(res, 200, converseToOpenai(out, body.model, id, names));
+      return sendJson(res, 200, out.openai);
     }
 
-    const { out, rung } = await sendRouted((input) => client.send(new ConverseStreamCommand(input), { abortSignal: ac.signal }));
+    const { out, rung } = await sendRouted(async (b, r) => isCodex(r)
+      ? { codex: await sendCodex(r, b, ac.signal) }
+      : { bedrock: await client.send(new ConverseStreamCommand(openaiToConverse(b, r.modelId)), { abortSignal: ac.signal }) });
     startSse(res, decisionHeaders(log));
+    if (out.codex) {
+      const st = newResponsesState(body.model, id);
+      for await (const ev of out.codex.events) {
+        for (const chunk of responsesEventToOpenai(st, ev)) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        if (ev.type === "response.function_call_arguments.delta") rt.tools.add(st.toolIndex.get(ev.item_id) ?? 0, ev.delta ?? "");
+      }
+      noteQuota(rung, out.codex.quota);
+      log.stopReason = st.stopReason ?? null;
+      finishUsage(log, rung, st.usage ?? { input: 0, output: 0 }, rt);
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
     const st = newStreamState(body.model, id, names);
-    for await (const ev of out.stream ?? []) {
+    for await (const ev of out.bedrock!.stream ?? []) {
       if (ev.contentBlockDelta?.delta?.toolUse) rt.tools.add(ev.contentBlockDelta.contentBlockIndex ?? 0, ev.contentBlockDelta.delta.toolUse.input ?? "");
       for (const chunk of converseEventToOpenai(st, ev)) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     }
@@ -433,7 +498,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       ts: new Date().toISOString(), endpoint: url.pathname, clientModel: null, bedrockId: null, vendor: null, eligibleCount: null, skipped: [], degraded: [], stream: false,
       inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null, latencyMs: 0, costUsd: null, requestedCostUsd: null, stopReason: null, error: null,
       class: null, classReason: null, conversationKey: null, requestedModel: null, routedModel: null, sticky: false, escalated: false, escalationReason: null,
-      classifierNote: null, classifierMs: null, classifierCostUsd: null,
+      classifierNote: null, classifierMs: null, classifierCostUsd: null, provider: null, quotaPercent: null,
       sessionKey: sessionKeyOf(req.headers["x-bedrouter-session"]),
     };
     const ac = new AbortController();

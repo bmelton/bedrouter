@@ -16,6 +16,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   console.log(`config: ${process.env.BEDROUTER_CONFIG ?? "./bedrouter.json (or bedrouter.example.json)"}, routing ${cfg.routing?.enabled ? "on" : "off"}`);
   console.log(`  stack: ${cfg.stack.map((r) => `${r.alias}=${r.modelId}${r.enabled ? "" : " (disabled)"}`).join("  ")}`);
 
+  // A rung on another provider has its own credential, and it fails in its own way. Report it beside the AWS one
+  // rather than leaving a silent hole: bedrouter mints no token and runs no login flow, so the fix is `codex login`.
+  const codexRungs = cfg.stack.filter((r) => r.capabilities.transport === "openai-responses");
+  if (codexRungs.length) {
+    const { readCodexCredential } = await import("./codex.js");
+    for (const r of codexRungs) {
+      const file = r.auth?.kind === "oauth-file" ? r.auth.path ?? "~/.codex/auth.json" : "~/.codex/auth.json";
+      const cred = readCodexCredential(file);
+      if ("error" in cred) console.log(`codex: ${r.alias} (${r.enabled ? "enabled" : "disabled"}) -> ${cred.error}`);
+      else console.log(`codex: ${r.alias} (${r.enabled ? "enabled" : "disabled"}) -> ${file} ok, token valid until ${new Date(cred.expiresAt).toISOString()}`);
+    }
+  }
+
   const { Router } = await import("./router.js");
   const { baselineRung } = await import("./dashboard.js");
   const router = new Router(cfg);

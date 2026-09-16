@@ -31,6 +31,13 @@ switch (cmd && !cmd.startsWith("-") ? cmd : "serve") {
     console.log(describe(p, region));
     if (!p.ok && !process.env.BEDROUTER_SKIP_PREFLIGHT) process.exit(1);
     const cfg = loadConfig();
+    // A second provider has a second credential. This is a warning, never a stop: a rung whose token is missing just
+    // becomes unavailable, and every other rung still serves. `doctor` prints the detail.
+    for (const r of cfg.stack.filter((r) => r.enabled && r.capabilities.transport === "openai-responses")) {
+      const { readCodexCredential } = await import("./codex.js");
+      const cred = readCodexCredential(r.auth?.kind === "oauth-file" ? r.auth.path : undefined);
+      if ("error" in cred) console.log(`warning: rung "${r.alias}" is enabled but ${cred.error}`);
+    }
     // Publishing runs beside the server rather than inside it, so createServer stays a pure request path with no
     // background uploader to stub out in a test.
     startPublishLoop(cfg);

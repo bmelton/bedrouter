@@ -3,16 +3,16 @@
 - [x] Spike: verify the Codex Responses endpoint accepts third-party tool definitions and streaming (go/no-go)
 - [x] Spike: confirm token location, refresh flow, and what quota exhaustion returns
       (**GO**, with three design changes. See "Spike results" below before doing anything else.)
-- [ ] Settle the seat question: per-developer local only, or shareable
-- [ ] Rename `bedrockId` to `modelId` (mechanical, own commit)
-- [ ] Add `auth` to the rung, with a resolver table (`aws-default-chain`, `oauth-file`)
-- [ ] Add `transport: "openai-responses"` and dispatch on transport in `server.ts`
-- [ ] Write `openaiToResponses` / `responsesToOpenai` plus stream event mapping
-- [ ] Make `Router.unavailable` time-boxed (`Map<alias, untilMs>`)
-- [ ] Classify Codex errors as rung-fatal, quota, or capability
-- [ ] Count tokens per provider in `report.ts` and `/v1/conversations/:key`
-- [ ] Extend `doctor` and `preflight` to check the Codex credential
-- [ ] Add a `codex` rung to `bedrouter.example.json`, disabled by default
+- [x] Settle the seat question: per-developer local only, or shareable (settled below: local, per developer)
+- [x] Rename `bedrockId` to `modelId` (mechanical, own commit)
+- [x] Add `auth` to the rung, with a resolver table (`aws-default-chain`, `oauth-file`)
+- [x] Add `transport: "openai-responses"` and dispatch on transport in `server.ts`
+- [x] Write `openaiToResponses` / `responsesToOpenai` plus stream event mapping
+- [x] Make `Router.unavailable` time-boxed (`Map<alias, untilMs>`)
+- [x] Classify Codex errors as rung-fatal, quota, or capability
+- [x] Count tokens per provider in `report.ts` and `/v1/conversations/:key`
+- [x] Extend `doctor` and `preflight` to check the Codex credential
+- [x] Add a `codex` rung to `bedrouter.example.json`, disabled by default
 
 ## Goal
 
@@ -253,7 +253,45 @@ the Codex client. Then check:
    `~/.codex/auth.json` with an access token, a refresh token, and an account
    identifier, but this is unverified.
 
-## Open question: seats
+## Settled: seats, 2026-09-16
+
+**Local, per developer.** Each machine reads its own `~/.codex/auth.json`, which
+its own `codex login` maintains. No shared bedrouter serves a team from one
+token, and nothing in the code makes that possible: the credential is read from a
+file path on the machine, never from config or an environment secret.
+
+The `codex` rung ships `enabled: false`, so turning it on is a deliberate local
+act. That holds whether the seat is a personal Plus subscription, as on the
+machine that ran the spike, or a corporate Enterprise seat on another machine.
+The design is identical either way; only the size of the allocation differs, and
+the router reads that from the response rather than from config.
+
+## Implementation notes, beyond the design above
+
+Four places where what was built differs from what was written, each because the
+spike said so:
+
+- **No token refresh.** The access token lasts 240 hours and the Codex CLI
+  rewrites `auth.json` when it refreshes, so bedrouter re-reads the file and gets
+  the new token for free. An expired token is detected locally from the JWT
+  `exp`, before any request is sent, and the rung stands down for five minutes
+  with a message naming `codex login`. Implementing the OAuth refresh would mean
+  bedrouter holding a client secret, which the "no credential storage of our own"
+  rule forbids.
+- **Quota is read, not awaited.** `routing.quotaStandDownPercent` (default 90)
+  stands a rung down when either allocation window passes it, using the reset
+  time the response already carries. The 429 path remains as the backstop.
+- **The output cap is dropped, not clamped.** `forRung` gained a third behaviour
+  and `eligible()` records `drop-maxTokens` rather than `clamp-maxTokens`.
+- **Non-streaming is assembled.** `collectChunks()` folds the chunk stream back
+  into one `chat.completion`, because the endpoint refuses `stream: false`.
+
+Verified end to end on 2026-09-16: a live request through bedrouter routed to
+`codex`, returned a mapped `get_weather` tool call on both the streaming and the
+non-streaming path, logged `provider=codex`, `costUsd=0`, 60 input and 19 output
+tokens, `quotaPercent=15`, and `degraded=["codex:drop-maxTokens"]`.
+
+## Superseded: the original seat question
 
 A ChatGPT Enterprise entitlement is per seat, and the Codex endpoint exists for
 that person's Codex client. A bedrouter on a developer's own machine, reading

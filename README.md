@@ -315,6 +315,54 @@ aggregates only: counts, tokens, dollars, model aliases, and signal names.
 `classifierNote` is free text a model wrote about a prompt and can therefore
 quote one, so `aggregate()` drops it rather than the renderer hiding it.
 
+## A second provider
+
+A rung does not have to be on Bedrock. `capabilities.transport` picks the
+transport, and `auth` picks the credential:
+
+```json
+{ "alias": "codex", "modelId": "gpt-5.6-sol", "vendor": "openai", "enabled": false,
+  "inputPerM": 0, "outputPerM": 0, "serves": ["execute", "explore"],
+  "auth": { "kind": "oauth-file", "path": "~/.codex/auth.json" },
+  "capabilities": { "transport": "openai-responses", "api": "responses", "toolUse": true, "streaming": true, "...": "..." } }
+```
+
+A prepaid seat is a rung priced at zero. That is the whole routing change: zero
+sorts it first in `Router.ranked`, and it still has to pass `serves` and every
+capability filter before it can answer anything. There is no cost bucket and no
+preference mode, because a second ranking system would contradict the rule that
+only `Router.ranked` compares rung positions.
+
+It ships disabled. A ChatGPT entitlement is per seat, so each machine uses its
+own `codex login` and enabling the rung is a deliberate local act. bedrouter
+mints no token, stores none of its own, and runs no login flow: it reads the file
+the `codex` CLI already maintains, notices an expired token before sending
+anything, and tells you to run `codex login`.
+
+Three facts about that endpoint, all verified rather than assumed, shape the
+behaviour:
+
+| Fact | What bedrouter does |
+| --- | --- |
+| `stream: false` is refused | Always streams upstream, and assembles one response when the client did not ask for a stream |
+| `max_output_tokens` is refused | Drops the client's cap and records `drop-maxTokens`, instead of clamping it |
+| Every response reports the allocation | Stands the rung down at `routing.quotaStandDownPercent` (default 90) until the window resets, rather than waiting for a 429 |
+
+When the allocation is spent, the token is dead, or the rung is otherwise out,
+the existing retry machinery answers the same request on the next eligible rung,
+which is the cheapest Bedrock rung that serves the class. Free first, Bedrock
+after, with no operator action. `Router.unavailable` holds a time per rung:
+Bedrock's entitlement verdicts never expire, a spent allocation does.
+
+Because `$0.00` would hide an allocation draining away, tokens are tallied per
+provider as well as in dollars: `bedrouter report` prints a `by provider` table,
+`/v1/conversations/:key` carries `byProvider`, and each response carries
+`x-bedrouter-provider`.
+
+```sh
+bedrouter doctor        # which credential each provider will use, and whether it works
+```
+
 ## Team stats
 
 Off unless a `publish` block is present. Nothing leaves a machine without it.
