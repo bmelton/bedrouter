@@ -12,19 +12,24 @@
 - [x] **Wave 1** [PRICE-DASHBOARD.md](PRICE-DASHBOARD.md) (9 items, bedrouter only, ships as 0.7.0)
 - [x] **Wave 2a** [TEAM-STATS.md](TEAM-STATS.md) (11 items, bedrouter plus a new stats repository, ships as 0.8.0)
 - [x] **Wave 2b** HABLO-installer: render the `publish` block, no user input for shared values (9 items, below)
-- [ ] **Wave 3** [LOCAL-CODEX.md](LOCAL-CODEX.md) (13 items, gated on two spikes that start now)
+- [x] **Wave 3** [LOCAL-CODEX.md](LOCAL-CODEX.md) (13 items; the spikes said go, with three design changes)
 - [x] Plan-owned: the credential resolver, `bedrouter doctor` reporting it (below)
 - [x] Plan-owned: `prices.json` drift check in `rollup` (below)
-- [ ] Plan-owned: `modelId` accepted beside `bedrockId` for one minor version (below, lands with wave 3)
+- [x] Plan-owned: `modelId` accepted beside `bedrockId` for one minor version (below, landed with wave 3)
 - [x] Plan-owned: `Taskfile.yml` with a `secrets` task (below)
 
 33 feature items plus 4 plan-owned decisions. The count is the only size signal
 here. It is not an estimate of time.
 
-> Waves 1, 2a and 2b are code-complete on branch `feat/dashboard-and-team-stats`
-> (and `feat/team-stats-publish` in HABLO-installer), with 37 bedrouter tests and
-> 3 installer tests passing. Nothing is pushed and nothing is published.
+> All four waves are code-complete on branch `feat/dashboard-and-team-stats`
+> (and `feat/team-stats-publish` in HABLO-installer), with 52 bedrouter tests and
+> 3 new installer tests passing. Nothing is pushed and nothing is published.
 > [TODO.md](TODO.md) holds every remaining action that needs a person.
+>
+> The Codex spikes ran on 2026-09-16 and returned **go**, but changed three
+> things the design had assumed. They are recorded in
+> [LOCAL-CODEX.md](LOCAL-CODEX.md) under "Spike results" and summarised under
+> "Implementation notes".
 
 ## The shape of it
 

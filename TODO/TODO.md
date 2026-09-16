@@ -11,7 +11,7 @@ is not mine to make. Ordered so that each item unblocks the ones under it.
 - [ ] 5. Check the 409 retry against a real repository, once, before the first publish
 - [ ] 6. Publish `bedrouter@0.8.0` to npm
 - [ ] 7. Decide the team `baselineAlias`
-- [ ] 8. Run the Codex spikes, which gate wave 3
+- [ ] 8. Decide whether to enable the `codex` rung, and on which machines
 - [ ] 9. Two pre-existing HABLO-installer problems, neither mine
 
 ## 1. Create the stats repository and push it
@@ -100,16 +100,31 @@ That default is defensible, but it is a claim about what the team would have use
 without a router, so it is worth an explicit decision. Set it to a named rung if
 `opus` overstates the counterfactual.
 
-## 8. Run the Codex spikes
+## 8. Decide whether to enable the `codex` rung
 
-Wave 3 is gated on items 1 and 2 of [LOCAL-CODEX.md](LOCAL-CODEX.md), which need
-a Codex OAuth token at `~/.codex/auth.json` and live calls to a third-party
-endpoint. I did not attempt either.
+Wave 3 is built and verified live, but the rung ships `enabled: false` in both
+`bedrouter.example.json` and `hablo.json`, because a ChatGPT entitlement is per
+seat. Enabling it is your call, per machine.
 
-The `bedrockId` to `modelId` rename is the only plan-owned decision still open,
-and it belongs to that wave. `config.ts` must read `modelId ?? bedrockId` for one
-minor version, because `install.mjs` and `hablo.json` both write `bedrockId` and
-a rename in one repository breaks the other.
+To enable it on a HABLO machine, set `enabled: true` on the `codex` rung in
+`hablo.json` and re-run the installer. Editing `~/.bedrouter/bedrouter.json`
+alone does not survive, because step 4 re-renders that file from the manifest on
+every run.
+
+Two things worth knowing before you do:
+
+- **The spike account is a Plus plan**, not Enterprise: a 5-hour and a 7-day
+  window, the weekly one already 15% spent. The code is identical either way, but
+  a Plus seat will displace much less Bedrock traffic than the goal in
+  [LOCAL-CODEX.md](LOCAL-CODEX.md) assumes.
+- **A real 429 has never been seen.** Triggering one means spending the whole
+  allocation, so I did not. `routing.quotaStandDownPercent` (default 90) should
+  mean you never reach one, and the 429 path is a tested backstop, but its live
+  body and status are still unverified.
+
+The `bedrockId` to `modelId` rename landed in both repositories. `config.ts`
+reads `modelId ?? bedrockId` for one release; delete that line in 1.0.0, and the
+`ponytail:` comment on it says so.
 
 ## 9. Two pre-existing HABLO-installer problems
 
@@ -125,6 +140,20 @@ them alone.
   from the earlier HAB-1 ticket. Commit it or restore it, as you prefer.
 
 ## Known gaps, recorded rather than guessed
+
+Three from wave 3, none blocking:
+
+- **A live 429 is unverified**, as above. Everything else about the Codex
+  endpoint was checked against it directly.
+- **No token refresh.** bedrouter re-reads `~/.codex/auth.json` and relies on the
+  Codex CLI to refresh it, which it does with a 240-hour lifetime. A machine that
+  runs bedrouter but never runs `codex` would eventually need a `codex login`.
+  Implementing the OAuth refresh would mean bedrouter holding a client secret.
+- **`maxOutput: 272000` on the codex rung is documentation, not a measurement.**
+  The endpoint rejects `max_output_tokens`, so the number cannot be enforced and
+  is never sent; it records the model's context rather than a verified output
+  ceiling.
+
 
 Two things the decision log cannot supply today. Neither blocks anything, and
 both would need a new log field before they could be fixed.
