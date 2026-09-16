@@ -1,7 +1,8 @@
 # Feature: second provider (local Codex over OAuth)
 
-- [ ] Spike: verify the Codex Responses endpoint accepts third-party tool definitions and streaming (go/no-go)
-- [ ] Spike: confirm token location, refresh flow, and what quota exhaustion returns
+- [x] Spike: verify the Codex Responses endpoint accepts third-party tool definitions and streaming (go/no-go)
+- [x] Spike: confirm token location, refresh flow, and what quota exhaustion returns
+      (**GO**, with three design changes. See "Spike results" below before doing anything else.)
 - [ ] Settle the seat question: per-developer local only, or shareable
 - [ ] Rename `bedrockId` to `modelId` (mechanical, own commit)
 - [ ] Add `auth` to the rung, with a resolver table (`aws-default-chain`, `oauth-file`)
@@ -130,6 +131,108 @@ show which pool paid for the turn. The header set stays otherwise stable.
 No configured allocation budget. Declaring the monthly limit in config would
 duplicate state the provider owns and would drift out of date. The 429 is
 authoritative.
+
+## Spike results, 2026-09-16
+
+Run against a live account from a plain `fetch`, not the Codex client. Endpoint:
+
+    POST https://chatgpt.com/backend-api/codex/responses
+
+Verdict: **go.** Third-party tool definitions survive, and a 40-tool surface
+behaves. Three findings change the design below, and one changes the premise.
+
+### 1. Tools pass through, at Pi's scale
+
+One tool definition returns a `function_call` item with the arguments streamed as
+`response.function_call_arguments.delta` and closed by `.done`, in a shape
+`responsesToOpenai` can map directly. A 40-tool surface costs 1471 input tokens
+and calls the right tool by name. A `function_call_output` turn is accepted, so
+the second agent turn round-trips.
+
+`tool_mode: "code_mode_only"` in `~/.codex/models_cache.json` is a client-side
+hint, not a server restriction: `gpt-5.6-sol` and `gpt-6-astra` carry it and both
+accepted arbitrary tools anyway.
+
+This was the question that could have killed the feature. It did not.
+
+### 2. Streaming is mandatory, not a capability
+
+    {"detail": "Stream must be set to true"}   // 400
+
+`stream: false` is refused outright. So `capabilities.streaming` is always true
+for a Codex rung, and a non-streaming client request cannot be passed through:
+the transport must consume the SSE stream and assemble one response. That is work
+the Converse path never needed, because Bedrock offers both shapes.
+
+### 3. `max_output_tokens` is unsupported
+
+    {"detail": "Unsupported parameter: max_output_tokens"}   // 400
+
+This contradicts the rule in AGENTS.md that the client's cap is a ceiling to be
+honoured or clamped. On this transport it can be neither: the field has to be
+**dropped**, and `forRung` must learn the difference between clamping a cap and
+removing one. A Codex rung's `capabilities.maxOutput` is therefore not a number
+the client can influence, and recording a real one requires measuring where the
+model stops on its own.
+
+### 4. Quota is observable before it runs out
+
+Every 200 carries the allocation state, so waiting for a 429 is unnecessary:
+
+| Header | Value seen |
+| --- | --- |
+| `x-codex-plan-type` | `plus` |
+| `x-codex-primary-used-percent` / `-window-minutes` | `0` / `300` (a 5-hour window) |
+| `x-codex-secondary-used-percent` / `-window-minutes` | `15` / `10080` (a 7-day window) |
+| `x-codex-primary-reset-after-seconds` / `-reset-at` | `17944` / epoch |
+| `x-codex-credits-balance`, `-has-credits`, `-unlimited` | `0`, `False`, `False` |
+
+`markUnavailable(alias, untilMs)` can therefore be fed `reset-after-seconds`
+directly, and a rung can be stood down *before* exhaustion by reading
+`used-percent`. **The 429 body itself is still unverified**, because triggering
+it means spending the whole allocation. The headers make that unnecessary rather
+than answering it.
+
+### 5. Two error shapes, not one
+
+    400  {"detail": "..."}                                        parameter or model problem
+    401  {"error": {"message": "...", "code": "unauthorized_unknown"}, "status": 401}
+
+An unusable model id is a 400 with a readable `detail`
+("The 'x' model is not supported when using Codex with a ChatGPT account"), not
+the Bedrock-style split between `ValidationException` and `AccessDeniedException`.
+Error classification needs both shapes.
+
+### 6. The credential, confirmed
+
+`~/.codex/auth.json` holds `tokens.{id_token, access_token, refresh_token,
+account_id}` plus `last_refresh`, and `auth_mode: "chatgpt"`. The access token is
+a JWT for `https://api.openai.com/v1` with a **240 hour** lifetime, so a refresh
+is due roughly every ten days rather than hourly. The `chatgpt-account-id` header
+turns out to be optional: a request without it still returned 200.
+
+### 7. The premise changed: this is a Plus plan, not Enterprise
+
+The goal above says the point is consuming a prepaid **ChatGPT Enterprise**
+allocation. The account that answered this spike reports `x-codex-plan-type:
+plus`, with 15% of a weekly window already spent and no credit balance. A
+personal Plus subscription is still prepaid, so "free at the margin" holds, but
+the allocation is far smaller than the goal assumes and the seat question below
+is no longer about a corporate entitlement.
+
+### Models
+
+All seven report `context_window: 272000` and `max_context_window: 872000`.
+`gpt-5.5` is the only one whose `tool_mode` is unset; the rest are
+`code_mode_only`, which the spike showed does not restrict tools.
+
+| Slug | Visible | Notes |
+| --- | --- | --- |
+| `gpt-5.6-sol` | yes | The configured default in `~/.codex/config.toml` |
+| `gpt-6-astra` | yes | |
+| `gpt-5.6-terra`, `gpt-5.6-luna` | yes | |
+| `gpt-5.5` | yes | Only model without `code_mode_only` |
+| `gpt-reserve`, `codex-auto-review` | hidden | `visibility: hide` |
 
 ## Verification, before any translator is written
 
