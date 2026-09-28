@@ -37,7 +37,11 @@ test("baseline defaults to the dearest enabled rung that serves explore", () => 
   assert.equal(baseline.alias, "big");
   assert.equal(baselineRung(ranked, "mid").alias, "mid");
   assert.throws(() => baselineRung(ranked, "nope"), /not a rung in the stack/);
-  assert.throws(() => baselineRung(ranked, "off"), /disabled rung/);
+  // A pinned rung may be disabled. Prices survive the entitlement probe even when the rung does not, and pricing a
+  // counterfactual routes nowhere. Refusing it would break the pin on exactly the accounts whose baseline was drifting.
+  assert.equal(baselineRung(ranked, "off").alias, "off");
+  // Zero-priced is a different matter: a subscription rung would report every window as 0% saved forever.
+  assert.throws(() => baselineRung([...ranked, rung("free", 0, ["explore"])], "free"), /priced at zero/);
 });
 
 test("totals price the same tokens twice and subtract the classifier from savings", () => {
@@ -120,3 +124,50 @@ test("the page is self-contained and escapes what it prints", () => {
 });
 
 const round = (n: number) => Math.round(n * 1e6) / 1e6;
+
+test("the comparison panel prices the window against named models, not rungs", () => {
+  // 7 priced lines of 1M input each (the upgrade line included), so a $3/M model would have cost $21.
+  const comparisons = [
+    { name: "Dear Model", inputPerM: 3, outputPerM: 12 },
+    { name: "Cheap Model", inputPerM: 0.01, outputPerM: 0.04 },
+    // Subscription-billed: no per-token price, so it must not appear as "the router cost you everything".
+    { name: "Flat Fee", inputPerM: 0, outputPerM: 0 },
+  ];
+  const v = aggregate(lines, { baseline, ranks, comparisons });
+
+  assert.deepEqual(v.comparisons.map((c) => c.name), ["Dear Model", "Cheap Model"], "zero-priced dropped, dearest first");
+
+  const dear = v.comparisons[0];
+  const priced = lines.filter((l) => l.costUsd != null).length;
+  assert.equal(round(dear.wouldCostUsd), round(priced * 1_000_000 * 3 / 1_000_000));
+  // Savings net off the classifier, exactly as the headline tile does.
+  assert.equal(round(dear.savedUsd), round(dear.wouldCostUsd - v.totals.costUsd - v.totals.classifierUsd));
+  assert.ok(dear.savedUsd > 0 && dear.savedPct > 0);
+
+  // Routing to something dearer than the comparison must read as a loss, never as a silent zero.
+  assert.ok(v.comparisons[1].savedUsd < 0, "a cheaper model than the router shows negative savings");
+
+  // A named model need not be a rung, and an unconfigured list leaves the panel off entirely.
+  assert.equal(aggregate(lines, { baseline, ranks }).comparisons.length, 0);
+
+  const html = renderHtml(v, { generatedAt: "t" });
+  assert.ok(html.includes("Dear Model") && html.includes("If every request had gone to one model"));
+  assert.ok(!html.includes("Flat Fee"), "a zero-priced model is absent from the page, not shown as 100% saved");
+});
+
+test("each table panel opens in a native dialog, in a saved snapshot as well as a live page", () => {
+  const v = aggregate(lines, { baseline, ranks, comparisons: [{ name: "Dear Model", inputPerM: 3, outputPerM: 12 }] });
+  for (const live of [true, false]) {
+    const html = renderHtml(v, { generatedAt: "t", live });
+    assert.ok(html.includes("<dialog id=\"m\""), "the dialog element is present");
+    // A snapshot on disk must expand too: an affordance that does nothing offline is worse than none.
+    assert.ok(html.includes("showModal()"), `modal script present when live=${live}`);
+    assert.equal(html.includes("location.reload"), live, "the refresh script stays live-only");
+    // Every table panel is expandable, and each carries the title the modal header reads.
+    const panels = [...html.matchAll(/class="panel x"[^>]*data-title="([^"]+)"/g)].map((m) => m[1]);
+    assert.deepEqual(panels, ["What the router did", "Where the money went", "If every request had gone to one model"]);
+    // The chart panels are not expandable: an SVG already scales to its column and does not pinch.
+    assert.ok(/class="panel"><h2>Spend by/.test(html), "chart panels stay plain");
+    assert.ok(!/(src|href)="http/.test(html), "the modal must not make the page fetch anything");
+  }
+});

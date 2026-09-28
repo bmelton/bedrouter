@@ -29,6 +29,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     const router = new Router(loadConfig());
     const view = aggregate(lines, {
       baseline: baselineRung(router.ranked, router.rc.baselineAlias),
+      comparisons: router.rc.comparisons,
       ranks: Object.fromEntries(router.ranked.map((r, i) => [r.alias, i])),
       bucket: opt("bucket") === "hour" ? "hour" : "day",
     });

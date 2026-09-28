@@ -479,6 +479,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
         if (sinceParam && Number.isNaN(since)) throw new HttpError(400, `since "${sinceParam}" is not a timestamp`);
         const view = aggregate(readLogLines(), {
           baseline: baselineRung(router.ranked, router.rc.baselineAlias), ranks, since,
+          comparisons: router.rc.comparisons,
           bucket: url.searchParams.get("bucket") === "hour" ? "hour" : "day",
           session: url.searchParams.get("session") ?? undefined,
         });

@@ -185,6 +185,9 @@ export function mergeIndex(files: { path: string; body: unknown }[], prices: Pri
       window: { fromIso: dates[0] ?? null, toIso: dates.at(-1) ?? null, bucket: "day", session: null },
       baseline: { alias: prices.baselineAlias, ...baseline },
       totals: t,
+      // The comparison panel is a local view. A published day file carries only prices.json rungs and a baselineAlias,
+      // so naming comparison models here would widen the team-stats schema for a display-only panel.
+      comparisons: [],
       rungs: [...rungCost.keys()].sort((a, b) => (prices.rungs[a]?.inputPerM ?? 0) - (prices.rungs[b]?.inputPerM ?? 0) || a.localeCompare(b)),
       buckets: [...buckets.values()].sort((a, b) => a.key.localeCompare(b.key)),
       // A day file groups tokens by routed rung and by requested rung separately, and never pairs them, so the team

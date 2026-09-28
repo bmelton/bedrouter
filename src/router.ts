@@ -5,9 +5,22 @@ export type Class = "trivial" | "execute" | "explore";
 export type RoutingConfig = { enabled:boolean; honorClientModel:boolean; trivialBelowFloor:boolean; upgradeOnIntent:boolean; classifier:{enabled:boolean;model:string|null;mode:"fallback"|"always";maxChars:number;timeoutMs:number}; maxConversations:number;retryWindowMs:number;cacheHitRate:number;
  /** The rung the dashboard prices the "no router" counterfactual at. Null takes the dearest enabled rung that serves explore. */
  baselineAlias:string|null;
+ /**
+  * Models the dashboard prices the same window against, for the comparison panel. Names a reader recognises rather
+  * than rungs: an entry need not be in the stack, and need not be one this account can invoke, because the question
+  * is what the traffic would have cost there. Prices are per million tokens, base tier.
+  */
+ comparisons:{name:string;inputPerM:number;outputPerM:number}[];
  /** Percentage of a provider's allocation window at which its rung stands down, before exhaustion rather than after. */
  quotaStandDownPercent:number;injectedMarkers:string[];shape:{exploreInputTokens:number;exploreTools:number;executeTurns:number;executeLastUserChars:number;trivialMaxChars:number;trivialMaxInputTokens:number;humanTurnMaxChars:number};keywords:Record<"execute"|"explore",string[]> };
-export const ROUTING_DEFAULTS:RoutingConfig={enabled:false,honorClientModel:true,trivialBelowFloor:true,upgradeOnIntent:true,classifier:{enabled:false,model:null,mode:"fallback",maxChars:4000,timeoutMs:4000},maxConversations:1000,retryWindowMs:60000,cacheHitRate:.8,baselineAlias:null,quotaStandDownPercent:90,
+export const ROUTING_DEFAULTS:RoutingConfig={enabled:false,honorClientModel:true,trivialBelowFloor:true,upgradeOnIntent:true,classifier:{enabled:false,model:null,mode:"fallback",maxChars:4000,timeoutMs:4000},maxConversations:1000,retryWindowMs:60000,cacheHitRate:.8,baselineAlias:null,
+ // Frontier models a reader recognises, for the dashboard comparison panel. Opus/Fable/GLM-5 match the stack's own
+ // rung prices; Sol and Terra are direct-provider list prices and are not rungs anyone here can invoke. Each has a
+ // higher tier above 272k input tokens that this ignores, so a long-context window understates the saving.
+ comparisons:[{name:"Claude Opus 5",inputPerM:5.5,outputPerM:27.5},{name:"Claude Fable 5.1",inputPerM:11,outputPerM:55},
+  {name:"GPT-5.6 Sol",inputPerM:5,outputPerM:30},{name:"GPT-5.6 Terra",inputPerM:2,outputPerM:12},
+  {name:"GLM-5",inputPerM:1,outputPerM:3.2}],
+ quotaStandDownPercent:90,
  // ponytail: prefix match against a marker list, not a parser. U+2063 is firstmate's invisible machine prefix; add a
  // marker per harness. The size cap is the backstop for harnesses that inject without marking.
  injectedMarkers:["⁣"],shape:{exploreInputTokens:60000,exploreTools:40,executeTurns:8,executeLastUserChars:200,trivialMaxChars:300,trivialMaxInputTokens:1500,humanTurnMaxChars:4000},keywords:{explore:[],execute:[]}};

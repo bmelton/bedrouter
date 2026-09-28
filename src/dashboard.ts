@@ -30,10 +30,20 @@ export type AggregateOpts = {
   baseline: Baseline;
   /** alias -> position in Router.ranked, cheapest first. The only thing that may compare rung positions. */
   ranks: Record<string, number>;
+  /** Named models to price the same traffic against, for the comparison panel. Independent of the stack. */
+  comparisons?: Comparison[];
   bucket?: "day" | "hour";
   since?: number;
   session?: string;
 };
+
+/**
+ * A model to price the window against, named for a reader rather than for the router: it need not be a rung, and it
+ * need not be one this account can invoke. Prices are per million tokens, base tier.
+ */
+export type Comparison = { name: string; inputPerM: number; outputPerM: number };
+/** One row of the comparison panel. `savedUsd` is negative when the router cost more than the named model would have. */
+export type ComparisonRow = Comparison & { wouldCostUsd: number; savedUsd: number; savedPct: number };
 
 export type Bucket = { key: string; requests: number; costUsd: number; baselineUsd: number; requestedUsd: number; byRung: Record<string, number> };
 export type RouteRow = { requested: string; routed: string; requests: number; costUsd: number; baselineUsd: number; savedUsd: number; upgrade: boolean };
@@ -54,6 +64,8 @@ export type View = {
   window: { fromIso: string | null; toIso: string | null; bucket: "day" | "hour"; session: string | null };
   baseline: Baseline;
   totals: Totals;
+  /** Empty when no comparison model is configured, or when the window has no priced traffic to price. */
+  comparisons: ComparisonRow[];
   rungs: string[];
   buckets: Bucket[];
   byRoute: RouteRow[];
@@ -67,12 +79,18 @@ export type View = {
  * The native baseline: what every request would have cost on the rung a client reaches for when there is no router.
  * Absent an explicit alias, that is the most expensive enabled rung that serves `explore`.
  * `ranked` must be `Router.ranked`, never `cfg.stack`.
+ *
+ * A named rung may be disabled. Pricing a counterfactual reads `inputPerM` and `outputPerM` and nothing else, so
+ * whether this account may route there is irrelevant to what the traffic would have cost there. Refusing a disabled
+ * rung would also defeat the point of pinning: the entitlement probe disables a rung when its fallbacks run out, so
+ * the pinned denominator would break on exactly the accounts whose baseline was drifting in the first place.
  */
 export function baselineRung(ranked: Rung[], alias?: string | null): Rung {
   if (alias) {
     const named = ranked.find((r) => r.alias === alias);
     if (!named) throw new Error(`routing.baselineAlias "${alias}" is not a rung in the stack`);
-    if (!named.enabled) throw new Error(`routing.baselineAlias "${alias}" names a disabled rung`);
+    // A subscription-billed rung has no per-token price, so it would report every window as 0% saved forever.
+    if (!named.inputPerM && !named.outputPerM) throw new Error(`routing.baselineAlias "${alias}" is priced at zero, so it cannot be a baseline`);
     return named;
   }
   for (let i = ranked.length - 1; i >= 0; i--) if (ranked[i].enabled && ranked[i].serves.includes("explore")) return ranked[i];
@@ -121,6 +139,11 @@ export function aggregate(lines: LogLine[], opts: AggregateOpts): View {
     b.requests++;
   }
 
+  // A model priced at zero bills by subscription rather than by token (the codex/sol rung is the standing example),
+  // so pricing the window against it would read as "the router cost you everything" and is dropped instead.
+  const comparisons = (opts.comparisons ?? []).filter((c) => c.inputPerM > 0 || c.outputPerM > 0);
+  const comparisonUsd = new Map(comparisons.map((c) => [c.name, 0]));
+
   for (const l of priced) {
     const cost = l.costUsd ?? 0;
     const requested = l.requestedCostUsd ?? cost;
@@ -132,6 +155,8 @@ export function aggregate(lines: LogLine[], opts: AggregateOpts): View {
     t.inputTokens += l.inputTokens ?? 0; t.outputTokens += l.outputTokens ?? 0; t.cacheReadTokens += l.cacheReadTokens ?? 0;
     t.costUsd += cost; t.requestedUsd += requested; t.baselineUsd += native;
     rungCost.set(routed, (rungCost.get(routed) ?? 0) + cost);
+    // Same counterfactual as `native` above, held against each named model instead of the one baseline rung.
+    for (const c of comparisons) comparisonUsd.set(c.name, comparisonUsd.get(c.name)! + estimateCost(c, usageOf(l)));
 
     const reqRank = opts.ranks[l.requestedModel ?? ""], gotRank = opts.ranks[routed];
     if (reqRank != null && gotRank != null) { t.comparableRequests++; if (gotRank < reqRank) t.cheaperRequests++; }
@@ -163,6 +188,13 @@ export function aggregate(lines: LogLine[], opts: AggregateOpts): View {
     window: { fromIso: times[0] ?? null, toIso: times.at(-1) ?? null, bucket, session: opts.session ?? null },
     baseline: { alias: opts.baseline.alias, inputPerM: opts.baseline.inputPerM, outputPerM: opts.baseline.outputPerM },
     totals: t,
+    // Dearest first, so the panel opens on the comparison that flatters the router least at the bottom.
+    comparisons: comparisons.map((c) => {
+      const wouldCostUsd = comparisonUsd.get(c.name)!;
+      // The classifier is part of what routing costs, exactly as t.savedUsd counts it.
+      const savedUsd = wouldCostUsd - t.costUsd - t.classifierUsd;
+      return { ...c, wouldCostUsd, savedUsd, savedPct: wouldCostUsd > 0 ? (savedUsd / wouldCostUsd) * 100 : 0 };
+    }).sort((a, b) => b.wouldCostUsd - a.wouldCostUsd),
     rungs: [...rungCost.keys()].sort((a, b) => (opts.ranks[a] ?? 1e9) - (opts.ranks[b] ?? 1e9) || a.localeCompare(b)),
     buckets: [...buckets.values()].sort((a, b) => a.key.localeCompare(b.key)),
     byRoute: [...routes.values()].sort((a, b) => b.costUsd - a.costUsd),
@@ -259,10 +291,22 @@ td.n,th.n{text-align:right}
 footer{color:var(--muted);font-size:12px;margin-top:24px;border-top:1px solid var(--line);padding-top:12px}
 button{font:inherit;padding:4px 10px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
 label{color:var(--muted);font-size:12px}
+.panel.x{cursor:zoom-in}
+.panel.x h2::after{content:" \\2922";opacity:.55;font-size:11px}
+.panel.x:focus-visible{outline:2px solid var(--muted);outline-offset:2px}
+/* Wider than .wrap so the modal is actually roomier than the page it came from, which is the whole point. */
+dialog{width:min(1280px,94vw);max-height:88vh;padding:0;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);overflow:hidden}
+dialog::backdrop{background:#000c}
+.dh{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.dh h2{margin:0}
+#mb{padding:4px 16px 16px;overflow:auto;max-height:calc(88vh - 58px)}
+/* The grid squeezes columns; in the modal let the content set its own width and scroll if it still will not fit. */
+#mb table{width:max-content;min-width:100%}
+#mb td,#mb th{padding:6px 14px;white-space:nowrap}
 `;
 
 /** One self-contained document. No network request of any kind, which the Content-Security-Policy also enforces. */
-export function renderHtml(view: View, opts: { generatedAt: string; live?: boolean }): string {
+export function renderHtml(view: View, opts: { generatedAt: string; live?: boolean; isHabloInstalled?: boolean }): string {
   const t = view.totals;
   const colourOf = new Map(view.rungs.map((r, i) => [r, PALETTE[i % PALETTE.length]]));
   const colour = (r: string) => colourOf.get(r) ?? PALETTE[0];
@@ -276,26 +320,50 @@ export function renderHtml(view: View, opts: { generatedAt: string; live?: boole
   // the team page has no `requested -> routed` table and shows a per-person one instead.
   const reasonCost = view.byReason.some((r) => r.costUsd != null);
   const reasonTitle = view.reasonTitle ?? { panel: "What the router did", column: "Deciding signal" };
-  const reasonPanel = !view.byReason.length ? "" : `<div class="panel"><h2>${esc(reasonTitle.panel)}</h2>
+  // A table panel sits in a 320px-minimum grid column, so its widest columns pinch. Clicking one reopens it in a
+  // native <dialog>, which brings its own focus trap, Escape handling and inertness: nothing to hand-roll or ship.
+  // The title is carried in a data attribute because the modal rebuilds its own header from the panel it was given.
+  const expandable = (title: string, body: string) =>
+    `<div class="panel x" tabindex="0" aria-haspopup="dialog" data-title="${esc(title)}"><h2>${esc(title)}</h2>${body}</div>`;
+  const reasonPanel = !view.byReason.length ? "" : expandable(reasonTitle.panel, `
     <table><thead><tr><th>${esc(reasonTitle.column)}</th><th class="n">Requests</th>${reasonCost ? `<th class="n">Cost</th>` : ""}</tr></thead><tbody>${
       view.byReason.map((r) => `<tr><td>${esc(r.reason)}</td><td class="n">${num(r.requests)}</td>${reasonCost ? `<td class="n">${usd(r.costUsd ?? 0)}</td>` : ""}</tr>`).join("")
-    }</tbody></table></div>`;
-  const routePanel = !view.byRoute.length ? "" : `<div class="panel"><h2>Where the money went</h2>
-    <table><thead><tr><th>Requested &rarr; routed</th><th class="n">Requests</th><th class="n">Cost</th><th class="n">Saved</th></tr></thead><tbody>${
-      view.byRoute.map((r) => `<tr><td>${esc(r.requested)} &rarr; ${esc(r.routed)}</td><td class="n">${num(r.requests)}</td><td class="n">${usd(r.costUsd)}</td><td class="n ${sign(r.savedUsd)}">${usd(r.savedUsd)}</td></tr>`).join("")
-    }</tbody></table></div>`;
-  const personPanel = !view.byPerson?.length ? "" : `<div class="panel"><h2>By person</h2>
-    <table><thead><tr><th>Developer</th><th class="n">Days</th><th class="n">Requests</th><th class="n">Cost</th><th class="n">Saved</th></tr></thead><tbody>${
-      view.byPerson.map((p) => `<tr><td>${esc(p.login)}</td><td class="n">${num(p.days)}</td><td class="n">${num(p.requests)}</td><td class="n">${usd(p.costUsd)}</td><td class="n ${sign(p.savedUsd)}">${usd(p.savedUsd)}</td></tr>`).join("")
-    }</tbody></table></div>`;
-  const panels = [reasonPanel, routePanel, personPanel].filter(Boolean).join("\n  ") || `<p class="empty">Nothing yet.</p>`;
+    }</tbody></table>`);
+  // Derived at render rather than stored on the row: a share is the row's own saving over its own baseline, and
+  // widening RouteRow/PersonRow would widen the published team-stats schema for a column the page can compute.
+  const savedShare = (savedUsd: number, baselineUsd: number) => (baselineUsd > 0 ? (savedUsd / baselineUsd) * 100 : 0);
+  const routePanel = !view.byRoute.length ? "" : expandable("Where the money went", `
+    <table><thead><tr><th>Requested &rarr; routed</th><th class="n">Requests</th><th class="n">Cost</th><th class="n">Saved</th><th class="n">Saved %</th></tr></thead><tbody>${
+      view.byRoute.map((r) => `<tr><td>${esc(r.requested)} &rarr; ${esc(r.routed)}</td><td class="n">${num(r.requests)}</td><td class="n">${usd(r.costUsd)}</td><td class="n ${sign(r.savedUsd)}">${usd(r.savedUsd)}</td><td class="n ${sign(r.savedUsd)}">${pct(savedShare(r.savedUsd, r.baselineUsd))}</td></tr>`).join("")
+    }</tbody></table>`);
+  const personPanel = !view.byPerson?.length ? "" : expandable("By person", `
+    <table><thead><tr><th>Developer</th><th class="n">Days</th><th class="n">Requests</th><th class="n">Cost</th><th class="n">Saved</th><th class="n">Saved %</th></tr></thead><tbody>${
+      view.byPerson.map((p) => `<tr><td>${esc(p.login)}</td><td class="n">${num(p.days)}</td><td class="n">${num(p.requests)}</td><td class="n">${usd(p.costUsd)}</td><td class="n ${sign(p.savedUsd)}">${usd(p.savedUsd)}</td><td class="n ${sign(p.savedUsd)}">${pct(savedShare(p.savedUsd, p.baselineUsd))}</td></tr>`).join("")
+    }</tbody></table>`);
+  // Named models rather than rungs, so the column says "model" and the panel stands apart from the baseline tiles.
+  const comparisonPanel = !view.comparisons.length ? "" : expandable("If every request had gone to one model", `
+    <table><thead><tr><th>Model</th><th class="n">$/M in &middot; out</th><th class="n">Would have cost</th><th class="n">Saved</th><th class="n">Saved %</th></tr></thead><tbody>${
+      view.comparisons.map((c) => `<tr><td>${esc(c.name)}</td><td class="n">$${c.inputPerM} &middot; $${c.outputPerM}</td><td class="n">${usd(c.wouldCostUsd)}</td><td class="n ${sign(c.savedUsd)}">${usd(c.savedUsd)}</td><td class="n ${sign(c.savedUsd)}">${pct(c.savedPct)}</td></tr>`).join("")
+    }</tbody></table>
+    <p class="sub">Same token counts, priced at each model's base rate. Actually spent: ${usd(t.costUsd + t.classifierUsd)}.</p>`);
+  const panels = [reasonPanel, routePanel, personPanel, comparisonPanel].filter(Boolean).join("\n  ") || `<p class="empty">Nothing yet.</p>`;
 
   const window = view.window.fromIso ? `${view.window.fromIso.slice(0, 16).replace("T", " ")} to ${view.window.toIso!.slice(0, 16).replace("T", " ")} UTC` : "no requests in range";
   // ponytail: auto-refresh reloads the page rather than re-rendering from data.json in the browser, which would mean a
   // second copy of this renderer in JavaScript. data.json stays the machine-readable surface and the testable one.
-  const script = opts.live
-    ? `<script>const b=document.getElementById('r'),c=document.getElementById('a');b.onclick=()=>location.reload();let t;c.onchange=()=>{clearTimeout(t);if(c.checked)t=setTimeout(()=>location.reload(),5000)};</script>`
+  const refresh = opts.live
+    ? `const b=document.getElementById('r'),c=document.getElementById('a');b.onclick=()=>location.reload();let t;c.onchange=()=>{clearTimeout(t);if(c.checked)t=setTimeout(()=>location.reload(),5000)};`
     : "";
+  // The modal copies the panel's own children, minus its heading, so a panel keeps one definition and the dialog
+  // never drifts from it. A click that ends a text selection is a drag, not a press, and must not open anything.
+  // Present in a saved snapshot too: an expandable panel that does nothing offline would be a broken affordance.
+  const modal = `const d=document.getElementById('m'),mb=document.getElementById('mb'),mt=document.getElementById('mt');
+const open=p=>{if(String(getSelection()))return;mt.textContent=p.dataset.title;mb.innerHTML=[...p.children].filter(c=>c.tagName!=='H2').map(c=>c.outerHTML).join('');d.showModal()};
+for(const p of document.querySelectorAll('.panel.x')){p.addEventListener('click',()=>open(p));p.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();open(p)}})}
+document.getElementById('mx').onclick=()=>d.close();
+d.addEventListener('click',e=>{if(e.target===d)d.close()});`;
+  const script = `<script>${refresh}${modal}</script>`;
+  const dialog = `<dialog id="m" aria-labelledby="mt"><div class="dh"><h2 id="mt"></h2><button id="mx" type="button">Close</button></div><div id="mb"></div></dialog>`;
   const controls = opts.live
     ? `<p class="sub"><button id="r" type="button">Refresh</button> <label><input id="a" type="checkbox"> auto every 5s</label></p>`
     : "";
@@ -304,7 +372,7 @@ export function renderHtml(view: View, opts: { generatedAt: string; live?: boole
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>bedrouter dashboard</title><style>${CSS}</style></head>
 <body><div class="wrap">
-<h1>bedrouter${view.window.session ? ` &middot; session ${esc(view.window.session)}` : ""}</h1>
+<h1>${opts.isHabloInstalled? 'Hablo Dashboard' : 'bedrouter'}${view.window.session ? ` &middot; session ${esc(view.window.session)}` : ""}</h1>
 <p class="sub">${esc(window)} &middot; ${num(t.requests)} requests &middot; baseline <b>${esc(view.baseline.alias)}</b> at $${view.baseline.inputPerM}/$${view.baseline.outputPerM} per million.
 Savings are an estimate: the token counts are held fixed and only the price varies, so another model's output length is not modelled.</p>
 ${controls}
@@ -316,8 +384,6 @@ ${controls}
 ${tile(usd(t.savedUsd), sign(t.savedUsd), `saved against ${esc(view.baseline.alias)}`)}
 ${tile(pct(t.savedPct), sign(t.savedUsd), "of the native baseline")}
 ${tile(num(t.requests), "", `requests, ${num(t.priced)} reached a model`)}
-${/* Merged day files pair nothing, so the team page has no pinned request to measure and drops the tile entirely. */
-    t.comparableRequests ? tile(pct(t.cheaperShare), "", `served below the rung asked for, of ${num(t.comparableRequests)} pinned`) : ""}
 ${t.classifierUsd > 0 || !t.classifierCalls
     // A merged day file carries classifier calls but no classifier tokens, so the team page counts them and prices nothing.
     ? tile(usd(t.classifierUsd), "", `classifier, ${num(t.classifierCalls)} calls`)
@@ -328,6 +394,6 @@ ${tile(num(t.escalations), "", t.topEscalation ? `escalations, mostly ${esc(t.to
   ${panels}
 </div>
 <footer>Actual ${usd(t.costUsd)} &middot; asked-for baseline ${usd(t.requestedUsd)} (${usd(t.savedVsRequestedUsd)} saved) &middot; native baseline ${usd(t.baselineUsd)} &middot; tokens in ${num(t.inputTokens)}, out ${num(t.outputTokens)}, cache-read ${num(t.cacheReadTokens)} &middot; ${num(t.errors)} errors &middot; generated ${esc(opts.generatedAt)}</footer>
-</div>${script}</body></html>
+</div>${dialog}${script}</body></html>
 `;
 }
