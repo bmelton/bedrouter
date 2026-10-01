@@ -1,11 +1,15 @@
 import "./env.js";
 import fs from "node:fs";
+import { loadConfig } from "./config.js";
+import { Router } from "./router.js";
+import { aggregate, baselineRung, renderHtml } from "./dashboard.js";
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   // Savings report over the decision log: what routing cost versus what the same usage would have cost on the model each
   // client asked for. Usage: npm run report [-- --log path] [--json] [--since 2026-09-14T00:00:00Z] [--session key]
+  //   [--html out.html] [--bucket day|hour]   the dashboard page, written to disk as a shareable snapshot
 
-  type Line = { ts: string; classifierCostUsd?: number | null; classifierMs?: number | null; class: string | null; classReason: string | null; requestedModel: string | null; routedModel: string | null; costUsd: number | null; requestedCostUsd: number | null; inputTokens: number | null; outputTokens: number | null; cacheReadTokens: number | null; latencyMs: number; error: string | null; escalated: boolean; escalationReason: string | null; conversationKey: string | null; sessionKey?: string | null; endpoint: string };
+  type Line = { ts: string; provider?: string | null; classifierCostUsd?: number | null; classifierMs?: number | null; class: string | null; classReason: string | null; requestedModel: string | null; routedModel: string | null; costUsd: number | null; requestedCostUsd: number | null; inputTokens: number | null; outputTokens: number | null; cacheReadTokens: number | null; latencyMs: number; error: string | null; escalated: boolean; escalationReason: string | null; conversationKey: string | null; sessionKey?: string | null; endpoint: string };
 
   const args = argv;
   const opt = (name: string) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : undefined; };
@@ -17,6 +21,22 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   if (!fs.existsSync(logPath)) { console.error(`no log at ${logPath}`); return 1; }
   const lines: Line[] = fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((l: Line) => Date.parse(l.ts) >= since && (!session || l.sessionKey === session));
   const priced = lines.filter((l) => l.costUsd != null);
+
+  const htmlOut = opt("html");
+  if (htmlOut) {
+    // The same renderer the server route uses, so a snapshot and the live page cannot disagree. It has no refresh
+    // control, because there is no server behind a file on disk.
+    const router = new Router(loadConfig());
+    const view = aggregate(lines, {
+      baseline: baselineRung(router.ranked, router.rc.baselineAlias),
+      comparisons: router.rc.comparisons,
+      ranks: Object.fromEntries(router.ranked.map((r, i) => [r.alias, i])),
+      bucket: opt("bucket") === "hour" ? "hour" : "day",
+    });
+    fs.writeFileSync(htmlOut, renderHtml(view, { generatedAt: `${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, live: false }));
+    console.log(`wrote ${htmlOut}  (${view.totals.requests} requests, baseline ${view.baseline.alias}, saved ${view.totals.savedUsd.toFixed(4)})`);
+    return 0;
+  }
 
   type Agg = { requests: number; costUsd: number; requestedCostUsd: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; escalations: number; latencyMs: number };
   const agg = (): Agg => ({ requests: 0, costUsd: 0, requestedCostUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, escalations: 0, latencyMs: 0 });
@@ -31,6 +51,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   const byClass = group((l) => l.class ?? "(unrouted)");
   const byRoute = group((l) => `${l.requestedModel ?? "?"} -> ${l.routedModel ?? "?"}`);
   const byReason = group((l) => l.classReason ?? "(none)");
+  // A prepaid rung bills $0.00 and still drains an allocation, so tokens are tallied per provider beside the dollars.
+  const byProvider = new Map<string, { requests: number; inputTokens: number; outputTokens: number }>();
+  for (const l of priced) { const k = l.provider ?? "bedrock"; const p = byProvider.get(k) ?? { requests: 0, inputTokens: 0, outputTokens: 0 }; p.requests++; p.inputTokens += l.inputTokens ?? 0; p.outputTokens += l.outputTokens ?? 0; byProvider.set(k, p); }
   const escalations = new Map<string, number>();
   for (const l of lines) if (l.escalationReason) escalations.set(l.escalationReason, (escalations.get(l.escalationReason) ?? 0) + 1);
   const errors = lines.filter((l) => l.error).length;
@@ -43,7 +66,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
   if (asJson) {
     const obj = (m: Map<string, Agg>) => Object.fromEntries(m);
-    console.log(JSON.stringify({ log: logPath, session: session ?? null, requests: lines.length, priced: priced.length, errors, conversations, total, classifier: { calls: classifierCalls.length, costUsd: classifierUsd, avgMs: classifierCalls.length ? classifierMs / classifierCalls.length : 0 }, savedUsd: saved, savedPct: pct, byClass: obj(byClass), byRoute: obj(byRoute), byReason: obj(byReason), escalations: Object.fromEntries(escalations) }, null, 2));
+    console.log(JSON.stringify({ log: logPath, session: session ?? null, requests: lines.length, priced: priced.length, errors, conversations, total, classifier: { calls: classifierCalls.length, costUsd: classifierUsd, avgMs: classifierCalls.length ? classifierMs / classifierCalls.length : 0 }, savedUsd: saved, savedPct: pct, byClass: obj(byClass), byRoute: obj(byRoute), byReason: obj(byReason), byProvider: Object.fromEntries(byProvider), escalations: Object.fromEntries(escalations) }, null, 2));
     return 0;
   }
 
@@ -66,6 +89,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   table("By class", byClass);
   table("By route (requested -> routed)", byRoute);
   table("By deciding signal", byReason);
+  if (byProvider.size > 1) {
+    // Only worth printing when more than one pool paid: a free rung's dollars are zero and its tokens are not.
+    console.log("\nBy provider (a prepaid rung costs nothing and still spends an allocation)");
+    for (const [k, p] of [...byProvider.entries()].sort((x, y) => y[1].requests - x[1].requests))
+      console.log(`  ${pad(k, 30)} ${num(p.requests, 6)} ${num(p.inputTokens, 9)} ${num(p.outputTokens, 8)}`);
+  }
   if (escalations.size) { console.log("\nEscalation triggers"); for (const [k, n] of escalations) console.log(`  ${pad(k, 30)} ${num(n, 6)}`); }
   return 0;
 }

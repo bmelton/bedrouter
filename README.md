@@ -259,6 +259,185 @@ with the escalation triggers at the end of the report.
 bedrouter report --since 2026-09-13T00:00:00Z --session <key> --log ./other.jsonl --json
 ```
 
+### The two baselines
+
+Savings need a counterfactual, and one number cannot carry both stories.
+
+The **asked-for baseline** is `requestedCostUsd` above: the same tokens priced at
+the rung the client named. It is the honest number for pinned traffic. It is weak
+for `auto` traffic, because `auto` already resolves to a cheap `execute` rung, so
+the comparison starts from a low price and the reported saving is near zero.
+
+The **native baseline** prices the same tokens at one configured top rung, which
+answers "what would this have cost if every request had gone to the big model".
+Set the rung in `bedrouter.json`:
+
+```json
+"routing": { "baselineAlias": "opus" }
+```
+
+Absent that key, the baseline is the dearest enabled rung that serves `explore`,
+taken from the selection order rather than from list price. A name that no
+enabled rung answers to is an error the dashboard reports; it never changes a
+routing decision.
+
+Both figures are computed when the page renders, from the token counts each log
+line already holds. Nothing extra is written on the request path, so correcting a
+price in the config re-prices the whole history at once. Both are estimates, not
+invoices: the counterfactual holds the token counts fixed and varies only the
+price, and the same prompt on another model emits a different number of output
+tokens.
+
+### The dashboard
+
+`GET /dashboard` renders those numbers as one page: spend per day split by routed
+rung against the native baseline, the savings rate per day, six headline tiles,
+and the `by deciding signal` and `requested -> routed` tables. A route that costs
+more than the baseline shows a negative saving in a distinct colour, never a
+zero, because a router that quietly spends more is the thing the page exists to
+catch.
+
+| Route | Returns |
+| --- | --- |
+| `GET /dashboard` | The page. One self-contained document: inline SVG charts, no script, style, font or image from anywhere else. A Content-Security-Policy header enforces it |
+| `GET /dashboard/data.json` | The same view model as JSON, so the numbers can be read without parsing HTML |
+
+Both accept `since` (ISO timestamp), `bucket` (`day` by default, or `hour`), and
+`session`, matching `bedrouter report`. The page reads the log after the fact and
+makes no Bedrock call, so a broken dashboard cannot make a request fail.
+
+```sh
+bedrouter report --html spend.html --bucket hour     # the same page, written to disk
+```
+
+The snapshot is meant to be sent to somebody, so the view model carries
+aggregates only: counts, tokens, dollars, model aliases, and signal names.
+`classifierNote` is free text a model wrote about a prompt and can therefore
+quote one, so `aggregate()` drops it rather than the renderer hiding it.
+
+## A second provider
+
+A rung does not have to be on Bedrock. `capabilities.transport` picks the
+transport, and `auth` picks the credential:
+
+```json
+{ "alias": "codex", "modelId": "gpt-5.6-sol", "vendor": "openai", "enabled": false,
+  "inputPerM": 0, "outputPerM": 0, "serves": ["execute", "explore"],
+  "auth": { "kind": "oauth-file", "path": "~/.codex/auth.json" },
+  "capabilities": { "transport": "openai-responses", "api": "responses", "toolUse": true, "streaming": true, "...": "..." } }
+```
+
+A prepaid seat is a rung priced at zero. That is the whole routing change: zero
+sorts it first in `Router.ranked`, and it still has to pass `serves` and every
+capability filter before it can answer anything. There is no cost bucket and no
+preference mode, because a second ranking system would contradict the rule that
+only `Router.ranked` compares rung positions.
+
+It ships disabled. A ChatGPT entitlement is per seat, so each machine uses its
+own `codex login` and enabling the rung is a deliberate local act. bedrouter
+mints no token, stores none of its own, and runs no login flow: it reads the file
+the `codex` CLI already maintains, notices an expired token before sending
+anything, and tells you to run `codex login`.
+
+Three facts about that endpoint, all verified rather than assumed, shape the
+behaviour:
+
+| Fact | What bedrouter does |
+| --- | --- |
+| `stream: false` is refused | Always streams upstream, and assembles one response when the client did not ask for a stream |
+| `max_output_tokens` is refused | Drops the client's cap and records `drop-maxTokens`, instead of clamping it |
+| Every response reports the allocation | Stands the rung down at `routing.quotaStandDownPercent` (default 90) until the window resets, rather than waiting for a 429 |
+
+When the allocation is spent, the token is dead, or the rung is otherwise out,
+the existing retry machinery answers the same request on the next eligible rung,
+which is the cheapest Bedrock rung that serves the class. Free first, Bedrock
+after, with no operator action. `Router.unavailable` holds a time per rung:
+Bedrock's entitlement verdicts never expire, a spent allocation does.
+
+Because `$0.00` would hide an allocation draining away, tokens are tallied per
+provider as well as in dollars: `bedrouter report` prints a `by provider` table,
+`/v1/conversations/:key` carries `byProvider`, and each response carries
+`x-bedrouter-provider`.
+
+```sh
+bedrouter doctor        # which credential each provider will use, and whether it works
+```
+
+## Team stats
+
+Off unless a `publish` block is present. Nothing leaves a machine without it.
+
+```json
+"publish": { "enabled": true, "repo": "acme/bedrouter-stats", "branch": "main", "intervalMs": 3600000, "credential": "auto" }
+```
+
+With it, the running server checks hourly and writes one file per closed UTC day
+to one path in a shared repository:
+
+```
+data/<github-login>/2026-09-16.json
+```
+
+One writer per path, and each path written once. That is what makes the rest
+safe. Concurrent publishers cannot clobber each other, because the contents API
+updates the branch ref without force and a ref update is compare-and-swap: a
+publisher that loses the race gets `409`, re-reads the tip and retries, and has
+no content to reconcile. Backfill is not a separate feature; a laptop that was
+off for a week publishes seven files on its next check.
+
+A failed publish is never fatal and never blocks a request.
+
+| Command | What it does |
+| --- | --- |
+| `bedrouter publish --dry-run` | Prints the payloads without writing. This is how to see what the redaction rules actually emit before opting in |
+| `bedrouter publish --since 2026-09-01` | Publishes by hand, oldest day first, skipping days already present |
+| `bedrouter rollup data --prices prices.json --out dist` | Merges day files into the team page. The stats repository's Action runs this |
+
+### The credential
+
+`credential: "auto"` takes `gh auth token --hostname github.com` when `gh` is
+authenticated, and falls back to `BEDROUTER_PUBLISH_TOKEN` from the environment
+or `.env`. With neither, publishing logs the reason once and does nothing. Pin
+the source with `"gh"` or `"env"`.
+
+Identity comes from the credential, not from config: one `GET /user` gives the
+login that names the directory and the numeric id that goes in the file, because
+a login can be renamed and an id cannot. Nothing to typo, and no way to publish
+as somebody else.
+
+A `gh` token usually carries broad `repo` scope, which is wider than this needs.
+Nothing here can narrow a token at use time, so `bedrouter doctor` reports the
+source, the identity and the scopes instead, and the only path bedrouter ever
+writes is the one it builds itself. For least privilege, use a fine-grained PAT
+with `contents: write` on the stats repository alone and set `"credential":
+"env"`.
+
+### What is published, and what never is
+
+Token counts, never dollars. Savings computed on each laptop would depend on
+that machine's prices and how stale its config is, so the aggregate would sum
+numbers that were not computed the same way. The team page prices everything
+from one `prices.json` in the stats repository, so every person's numbers are
+comparable and a price correction re-prices every past day at once.
+
+A day file holds counts and sums grouped by routed rung and by requested rung,
+plus class counts, classifier call count, escalation counts, and error counts by
+class. It contains no array at all.
+
+Never published: `classifierNote`, `conversationKey`, `sessionKey`, error text,
+and anything per request. `dailyRollup()` builds the payload from an allowlist,
+so a field added to the log is excluded until somebody adds it there on purpose,
+and `test/publish.test.ts` holds it to a fixture line carrying every forbidden
+field.
+
+A day file still shows that a named person worked on a given date and roughly how
+much. In a public stats repository that is world-readable. It is inherent to
+per-person daily stats, and the stats repository's README says so on its face.
+
+Only closed UTC days are published, so a file is complete when written and never
+needs an update. Late lines for an already-published day are dropped rather than
+rewriting history.
+
 ## Logs
 
 Every request appends one JSON line to `BEDROUTER_LOG` (default

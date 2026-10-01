@@ -1,0 +1,39 @@
+version: "3"
+
+# Project-local commands. The npm scripts stay as they are; these delegate to them, so there is one place to look
+# and no second definition to keep in step.
+
+tasks:
+  secrets:
+    desc: Pull this app's secrets from Infisical into .env
+    cmds:
+      - infisical export --format=dotenv > .env
+      - chmod 600 .env
+
+  build:
+    desc: Compile src/ to dist/
+    cmds: [npm run build]
+
+  test:
+    desc: Run the unit tests
+    cmds: [npm test]
+
+  typecheck:
+    desc: Type-check without emitting
+    cmds: [npm run typecheck]
+
+  check:
+    desc: What CI would run
+    cmds: [task: test, task: typecheck]
+
+  serve:
+    desc: Run the router
+    cmds: [npm start]
+
+  dashboard:
+    desc: Write the spend dashboard to spend.html
+    cmds: ["npx tsx src/cli.ts report --html spend.html"]
+
+  publish:
+    desc: Show what this machine would publish to the team stats repository, without writing
+    cmds: ["npx tsx src/cli.ts publish --dry-run"]

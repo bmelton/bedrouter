@@ -14,6 +14,8 @@ import { ClientError, converseEventToOpenai, converseToOpenai, newStreamState, o
 import { Router, ToolJsonCheck, type Class, type Decision } from "./router.js";
 import { describe, preflight } from "./preflight.js";
 import { classifyWithModel } from "./classifier.js";
+import { aggregate, baselineRung, renderHtml, type LogLine } from "./dashboard.js";
+import { CodexError, collectChunks, newResponsesState, responsesEventToOpenai, sendCodex, type Quota } from "./codex.js";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Json = any;
@@ -60,10 +62,19 @@ export type LogEntry = {
   classifierMs: number | null;
   classifierCostUsd: number | null;
   sessionKey: string | null; // client-supplied x-bedrouter-session (pi-bedrouter sends Pi's session id); null when absent
+  // A free rung is a different unit, not a cheap one: inputPerM 0 is right for ranking and wrong for reporting, so
+  // tokens are tallied per provider beside the dollar estimate and the allocation is recorded where it is known.
+  provider: string | null;
+  quotaPercent: number | null;
 };
+/** Which pool paid for the turn. Derived from the transport, so a new provider needs no new field. */
+export const providerOf = (rung: Rung): string => (rung.capabilities.transport === "openai-responses" ? "codex" : "bedrock");
 
 /** Running totals per conversation, served on GET /v1/conversations/:key for UI integrations (pi-bedrouter's footer). */
-export type ConversationStats = { key: string; requests: number; costUsd: number; requestedCostUsd: number; classifierCostUsd: number; inputTokens: number; outputTokens: number; escalations: number; class: Class | null; routedModel: string | null; requestedModel: string | null; lastTs: string };
+export type ProviderUsage = { requests: number; inputTokens: number; outputTokens: number };
+export type ConversationStats = { key: string; requests: number; costUsd: number; requestedCostUsd: number; classifierCostUsd: number; inputTokens: number; outputTokens: number; escalations: number; class: Class | null; routedModel: string | null; requestedModel: string | null; lastTs: string;
+  /** Tokens per provider. A prepaid rung costs $0.00 and still spends an allocation, so dollars alone hide it. */
+  byProvider: Record<string, ProviderUsage> };
 /**
  * Running totals per client session, served on GET /v1/sessions/:key. A session is whatever the client says it is via the
  * `x-bedrouter-session` request header (pi-bedrouter sends Pi's session id), so unlike a conversation it survives
@@ -93,6 +104,23 @@ function appendLog(entry: LogEntry) {
 
 class HttpError extends Error {
   constructor(public status: number, message: string) { super(message); }
+}
+
+// The dashboard page makes no network request at all, and this is what stops a later edit from quietly adding one.
+const DASHBOARD_CSP = "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'";
+// ponytail: whole-file read per request, cached by mtime and size. Stream and index by day if the log passes a few hundred MB.
+let logCache: { key: string; lines: LogLine[] } | null = null;
+function readLogLines(): LogLine[] {
+  let key: string;
+  try { const st = fs.statSync(LOG_PATH); key = `${st.mtimeMs}:${st.size}`; } catch { return []; }
+  if (logCache?.key === key) return logCache.lines;
+  const lines: LogLine[] = [];
+  for (const line of fs.readFileSync(LOG_PATH, "utf8").split("\n")) {
+    if (!line) continue;
+    try { lines.push(JSON.parse(line)); } catch { /* a line torn by a concurrent append */ }
+  }
+  logCache = { key, lines };
+  return lines;
 }
 
 const anthropicErrorType = (status: number) =>
@@ -133,6 +161,7 @@ function decisionHeaders(log: LogEntry): Record<string, string> {
   if (log.class) h["x-bedrouter-class"] = log.class;
   if (log.classReason) h["x-bedrouter-reason"] = log.classReason;
   if (log.conversationKey) h["x-bedrouter-conversation"] = log.conversationKey;
+  if (log.provider) h["x-bedrouter-provider"] = log.provider;
   if (log.classifierNote != null) h["x-bedrouter-classifier"] = log.classifierNote.replace(/[^\x20-\x7e]/g, "?").slice(0, 200);
   return h;
 }
@@ -155,10 +184,21 @@ function checkAuth(req: http.IncomingMessage) {
   if (got !== want) throw new HttpError(401, "invalid api key");
 }
 
-/** Bedrock rejects an output cap above the model's own limit, so bring the client's ceiling down to what this rung allows. */
+/**
+ * Fit the client's output cap to what the rung can accept. Three behaviours, not two:
+ *   - Bedrock rejects a cap above the model's own limit, so the ceiling is clamped down.
+ *   - The Codex Responses endpoint rejects the parameter outright, so the cap is dropped. It cannot be expressed,
+ *     and sending it fails the whole request; server.ts records `drop-maxTokens` so the log says the ceiling was lost.
+ */
 export function forRung(body: Json, rung: Rung): Json {
-  const want = Router.maxTokens(body), limit = rung.capabilities.maxOutput;
-  if (!want || want <= limit) return body;
+  const want = Router.maxTokens(body);
+  if (!want) return body;
+  if (rung.capabilities.transport === "openai-responses") {
+    const { max_tokens: _mt, max_completion_tokens: _mct, ...rest } = body;
+    return rest;
+  }
+  const limit = rung.capabilities.maxOutput;
+  if (want <= limit) return body;
   const out = { ...body };
   if (out.max_completion_tokens != null) out.max_completion_tokens = limit;
   if (out.max_tokens != null) out.max_tokens = limit;
@@ -186,7 +226,8 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
   const tally = (log: LogEntry) => {
     if (!log.conversationKey) return;
     let c = conversations.get(log.conversationKey);
-    if (!c) { c = { key: log.conversationKey, requests: 0, costUsd: 0, requestedCostUsd: 0, classifierCostUsd: 0, inputTokens: 0, outputTokens: 0, escalations: 0, class: null, routedModel: null, requestedModel: null, lastTs: log.ts }; }
+    if (!c) { c = { key: log.conversationKey, requests: 0, costUsd: 0, requestedCostUsd: 0, classifierCostUsd: 0, inputTokens: 0, outputTokens: 0, escalations: 0, class: null, routedModel: null, requestedModel: null, lastTs: log.ts, byProvider: {} }; }
+    if (log.provider) { const p = (c.byProvider[log.provider] ??= { requests: 0, inputTokens: 0, outputTokens: 0 }); p.requests++; p.inputTokens += log.inputTokens ?? 0; p.outputTokens += log.outputTokens ?? 0; }
     c.requests++; c.costUsd += log.costUsd ?? 0; c.requestedCostUsd += log.requestedCostUsd ?? log.costUsd ?? 0; c.classifierCostUsd += log.classifierCostUsd ?? 0;
     c.inputTokens += log.inputTokens ?? 0; c.outputTokens += log.outputTokens ?? 0; c.escalations += log.escalated ? 1 : 0;
     c.class = log.class; c.routedModel = log.routedModel; c.requestedModel = log.requestedModel; c.lastTs = log.ts;
@@ -223,6 +264,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
   const classifierRung = router.rc.classifier.enabled ? table.get(router.rc.classifier.model!) : undefined;
   if (router.rc.classifier.enabled && !classifierRung) throw new Error(`routing.classifier.model "${router.rc.classifier.model}" is not a known model`);
   const aliases = () => [...table.keys()];
+  const ranks = Object.fromEntries(router.ranked.map((r, i) => [r.alias, i]));
 
   const resolve = (name: unknown): Rung => {
     const rung = resolveModel(table, name);
@@ -246,7 +288,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       // on error/unparseable the rules' decision stands; the note in the log says why
     }
     Object.assign(log, {
-      clientModel: body.model, bedrockId: d.rung.bedrockId, vendor: d.rung.vendor, stream: !!body.stream,
+      clientModel: body.model, bedrockId: d.rung.modelId, vendor: d.rung.vendor, stream: !!body.stream, provider: providerOf(d.rung),
       class: d.class, classReason: d.classReason, conversationKey: d.conversationKey, requestedModel: requested.alias, routedModel: d.rung.alias, sticky: d.sticky,
       eligibleCount: d.eligibleCount, skipped: d.skipped, degraded: d.degraded,
     });
@@ -255,7 +297,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       const note = log.classifierNote != null ? `  classifier: "${log.classifierNote}" ${log.classifierMs} ms ${usd(log.classifierCostUsd)}` : "";
       const arrow = d.rung.alias === requested.alias ? "=" : "≠";
       debug(`  routed  ${requested.alias}${requested.auto ? " (auto)" : ""} ${arrow}> ${d.rung.alias}  ${via}${d.escalationReason ? `  escalation:${d.escalationReason}` : ""}  conv=${d.conversationKey ?? "-"}${note}`);
-      debug(`          ${d.rung.bedrockId}`);
+      debug(`          ${d.rung.modelId}`);
     }
     return d.rung;
   };
@@ -272,7 +314,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     payload.anthropic_version ??= "bedrock-2023-05-31";
     const betas = String(req.headers["anthropic-beta"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
     if (betas.length) payload.anthropic_beta = [...new Set([...(payload.anthropic_beta ?? []), ...betas])];
-    const cmd = { modelId: rung.bedrockId, contentType: "application/json", accept: "application/json", body: JSON.stringify(payload) };
+    const cmd = { modelId: rung.modelId, contentType: "application/json", accept: "application/json", body: JSON.stringify(payload) };
     const usage: Usage = { input: 0, output: 0 };
     const takeUsage = (u: Json) => {
       if (!u) return;
@@ -316,39 +358,81 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     const names = toolNameMap(body);
 
     /** Send, and when the chosen rung itself is the problem, drop it and reselect. Returns the rung that answered. */
-    const sendRouted = async <T>(send: (input: Json) => Promise<T>): Promise<{ out: T; rung: Rung }> => {
+    const sendRouted = async <T>(send: (routedBody: Json, rung: Rung) => Promise<T>): Promise<{ out: T; rung: Rung }> => {
       let rung = await route(req, body, log, rt);
       for (let tries = 0; ; tries++) {
         const routedBody = forRung(rt.decision?.degraded.length ? stripCachePoints(body) : body, rung);
-        try { return { out: await send(openaiToConverse(routedBody, rung.bedrockId)), rung }; }
+        try { return { out: await send(routedBody, rung), rung }; }
         catch (err) {
-          const fatal = unavailableModel(err) ? "unavailable" : capabilityValidation(err) ? "validation-contradiction" : null;
+          // Codex states its own verdict and how long it lasts; Bedrock's is inferred from the exception and is
+          // permanent, because an entitlement is a fact about (account, region, rung) rather than about a moment.
+          const fault = err instanceof CodexError ? err.fault : null;
+          const fatal = fault ? (fault.kind === "capability" ? "validation-contradiction" : "unavailable")
+            : unavailableModel(err) ? "unavailable" : capabilityValidation(err) ? "validation-contradiction" : null;
           if (!fatal || !rt.decision || tries >= MAX_REROUTES) throw err;
           const rejected = rung.alias;
-          if (fatal === "unavailable") router.markUnavailable(rejected);
+          if (fatal === "unavailable") router.markUnavailable(rejected, fault ? fault.untilMs : Infinity);
           else if (!router.invalidate(rt.decision, body)) throw err;
-          // nothing left to reselect: Bedrock's own verdict is more useful than "no eligible rung"
+          // nothing left to reselect: the provider's own verdict is more useful than "no eligible rung"
           try { rung = await route(req, body, log, rt); } catch { throw err; }
           // after the reroute, which replaces log.skipped wholesale. A learned denial needs no note: eligible() reports it.
           if (fatal !== "unavailable") log.skipped.push(`${rejected}:${fatal}`);
         }
       }
     };
+
+    const isCodex = (r: Rung) => r.capabilities.transport === "openai-responses";
+    /** A spent allocation is visible before it bites, so the rung stands down rather than failing the next request. */
+    const noteQuota = (rung: Rung, q: Quota | null) => {
+      if (!q) return;
+      log.quotaPercent = q.usedPercent;
+      if (q.usedPercent < router.rc.quotaStandDownPercent) return;
+      const until = Date.now() + Math.max(q.resetAfterS, 60) * 1000;
+      router.markUnavailable(rung.alias, until);
+      debug(`  quota   ${rung.alias} at ${q.usedPercent}% of its ${q.window} window, standing down until ${new Date(until).toISOString()}`);
+    };
     const id = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     const usageOf = (u: Json): Usage => ({ input: u?.inputTokens ?? 0, output: u?.outputTokens ?? 0, cacheRead: u?.cacheReadInputTokens, cacheWrite: u?.cacheWriteInputTokens });
 
     if (!body.stream) {
-      const { out, rung } = await sendRouted((input) => client.send(new ConverseCommand(input), { abortSignal: ac.signal }));
-      log.stopReason = out.stopReason ?? null;
-      finishUsage(log, rung, usageOf(out.usage), rt);
+      // Both transports normalise to one shape here, because the Codex endpoint refuses `stream: false` and its
+      // answer has to be assembled from the stream it insists on sending.
+      const { out, rung } = await sendRouted(async (b, r) => {
+        if (isCodex(r)) {
+          const st = newResponsesState(body.model, id);
+          const turn = await sendCodex(r, b, ac.signal);
+          const chunks: Json[] = [];
+          for await (const ev of turn.events) chunks.push(...responsesEventToOpenai(st, ev));
+          noteQuota(r, turn.quota);
+          return { openai: collectChunks(chunks, st), usage: st.usage ?? { input: 0, output: 0 }, stopReason: st.stopReason ?? null };
+        }
+        const o = await client.send(new ConverseCommand(openaiToConverse(b, r.modelId)), { abortSignal: ac.signal });
+        return { openai: converseToOpenai(o, body.model, id, names), usage: usageOf(o.usage), stopReason: o.stopReason ?? null };
+      });
+      log.stopReason = out.stopReason;
+      finishUsage(log, rung, out.usage, rt);
       for (const [k, v] of Object.entries(decisionHeaders(log))) res.setHeader(k, v);
-      return sendJson(res, 200, converseToOpenai(out, body.model, id, names));
+      return sendJson(res, 200, out.openai);
     }
 
-    const { out, rung } = await sendRouted((input) => client.send(new ConverseStreamCommand(input), { abortSignal: ac.signal }));
+    const { out, rung } = await sendRouted(async (b, r) => isCodex(r)
+      ? { codex: await sendCodex(r, b, ac.signal) }
+      : { bedrock: await client.send(new ConverseStreamCommand(openaiToConverse(b, r.modelId)), { abortSignal: ac.signal }) });
     startSse(res, decisionHeaders(log));
+    if (out.codex) {
+      const st = newResponsesState(body.model, id);
+      for await (const ev of out.codex.events) {
+        for (const chunk of responsesEventToOpenai(st, ev)) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        if (ev.type === "response.function_call_arguments.delta") rt.tools.add(st.toolIndex.get(ev.item_id) ?? 0, ev.delta ?? "");
+      }
+      noteQuota(rung, out.codex.quota);
+      log.stopReason = st.stopReason ?? null;
+      finishUsage(log, rung, st.usage ?? { input: 0, output: 0 }, rt);
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
     const st = newStreamState(body.model, id, names);
-    for await (const ev of out.stream ?? []) {
+    for await (const ev of out.bedrock!.stream ?? []) {
       if (ev.contentBlockDelta?.delta?.toolUse) rt.tools.add(ev.contentBlockDelta.contentBlockIndex ?? 0, ev.contentBlockDelta.delta.toolUse.input ?? "");
       for (const chunk of converseEventToOpenai(st, ev)) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     }
@@ -374,7 +458,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     const shape = url.pathname === "/v1/messages" ? "anthropic" : "openai";
     if (req.method === "GET" && url.pathname === "/health") return sendJson(res, 200, { ok: true, region, pid: process.pid, version: VERSION, routing: router.rc.enabled, classifier: router.rc.classifier.enabled ? router.rc.classifier.model : null, uptimeS: Math.round(process.uptime()) });
     if (req.method === "GET" && url.pathname === "/v1/models") {
-      const data = [...table.entries()].map(([id, r]) => ({ id, object: "model", created: 0, owned_by: r.vendor, bedrock_id: r.bedrockId,
+      const data = [...table.entries()].map(([id, r]) => ({ id, object: "model", created: 0, owned_by: r.vendor, bedrock_id: r.modelId,
         bedrouter: { vendor: r.vendor, rung: r.alias, auto: !!r.auto, enabled: r.enabled, serves: r.serves, capabilities: r.capabilities, inputPerM: r.inputPerM, outputPerM: r.outputPerM } }));
       return sendJson(res, 200, { object: "list", data });
     }
@@ -388,6 +472,25 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       return st ? sendJson(res, 200, st) : sendJson(res, 404, { error: { message: "unknown session" } });
     }
     if (req.method === "GET" && url.pathname === "/v1/sessions") return sendJson(res, 200, { data: [...sessions.values()].slice(-50).reverse() });
+    if (req.method === "GET" && (url.pathname === "/dashboard" || url.pathname === "/dashboard/data.json")) {
+      try {
+        const sinceParam = url.searchParams.get("since");
+        const since = sinceParam ? Date.parse(sinceParam) : 0;
+        if (sinceParam && Number.isNaN(since)) throw new HttpError(400, `since "${sinceParam}" is not a timestamp`);
+        const view = aggregate(readLogLines(), {
+          baseline: baselineRung(router.ranked, router.rc.baselineAlias), ranks, since,
+          comparisons: router.rc.comparisons,
+          bucket: url.searchParams.get("bucket") === "hour" ? "hour" : "day",
+          session: url.searchParams.get("session") ?? undefined,
+        });
+        if (url.pathname.endsWith(".json")) return sendJson(res, 200, view);
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": DASHBOARD_CSP, "cache-control": "no-store" });
+        return res.end(renderHtml(view, { generatedAt: `${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`, live: true }));
+      } catch (err) {
+        // A broken dashboard must never look like a broken router, so it answers for itself and nothing else changes.
+        return sendJson(res, errorStatus(err), errorBody(err, "openai"));
+      }
+    }
     const handler = req.method === "POST" ? { "/v1/messages": handleMessages, "/v1/chat/completions": handleChat }[url.pathname] : undefined;
     if (!handler) return sendJson(res, 404, errorBody(new HttpError(404, `no route for ${req.method} ${url.pathname}`), shape));
 
@@ -396,7 +499,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       ts: new Date().toISOString(), endpoint: url.pathname, clientModel: null, bedrockId: null, vendor: null, eligibleCount: null, skipped: [], degraded: [], stream: false,
       inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null, latencyMs: 0, costUsd: null, requestedCostUsd: null, stopReason: null, error: null,
       class: null, classReason: null, conversationKey: null, requestedModel: null, routedModel: null, sticky: false, escalated: false, escalationReason: null,
-      classifierNote: null, classifierMs: null, classifierCostUsd: null,
+      classifierNote: null, classifierMs: null, classifierCostUsd: null, provider: null, quotaPercent: null,
       sessionKey: sessionKeyOf(req.headers["x-bedrouter-session"]),
     };
     const ac = new AbortController();

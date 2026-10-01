@@ -1,15 +1,25 @@
 import fs from "node:fs";
 import type { Class, RoutingConfig } from "./router.js";
 
-export type Capabilities = { transport: "bedrock-runtime"; api: "converse"; toolUse: boolean; streaming: boolean; imageInput: boolean; structuredOutputs: boolean; promptCaching: boolean; contextWindow: number; maxOutput: number };
-export type Rung = { alias: string; bedrockId: string; vendor: string; enabled: boolean; inputPerM: number; outputPerM: number; serves: Class[]; capabilities: Capabilities; auto?: boolean };
-export type Config = { stack: Rung[]; aliases?: Record<string, string>; routing?: Omit<Partial<RoutingConfig>, "shape" | "keywords" | "classifier"> & { shape?: Partial<RoutingConfig["shape"]>; keywords?: Partial<RoutingConfig["keywords"]>; classifier?: Partial<RoutingConfig["classifier"]> } };
+export type Capabilities = { transport: "bedrock-runtime" | "openai-responses"; api: "converse" | "responses"; toolUse: boolean; streaming: boolean; imageInput: boolean; structuredOutputs: boolean; promptCaching: boolean; contextWindow: number; maxOutput: number };
+/**
+ * How a rung's credential is obtained. A table with two entries, not a plugin system: a third kind is added when a
+ * provider needs one. `aws-default-chain` is the SDK default chain and nothing else, as AGENTS.md requires.
+ */
+export type Auth = { kind: "aws-default-chain" } | { kind: "oauth-file"; path?: string };
+export type Rung = { alias: string; modelId: string; vendor: string; enabled: boolean; inputPerM: number; outputPerM: number; serves: Class[]; capabilities: Capabilities; auth?: Auth; auto?: boolean };
+/** Team stats publishing. An absent block means off: nothing leaves a machine without the block being there on purpose. */
+export type PublishConfig = { enabled?: boolean; repo?: string; branch?: string; intervalMs?: number; credential?: "auto" | "gh" | "env" };
+export type Config = { stack: Rung[]; aliases?: Record<string, string>; publish?: PublishConfig; routing?: Omit<Partial<RoutingConfig>, "shape" | "keywords" | "classifier"> & { shape?: Partial<RoutingConfig["shape"]>; keywords?: Partial<RoutingConfig["keywords"]>; classifier?: Partial<RoutingConfig["classifier"]> } };
 export const DEFAULT_CONFIG_PATH = "./bedrouter.json";
 
 export function loadConfig(file = process.env.BEDROUTER_CONFIG ?? DEFAULT_CONFIG_PATH): Config {
   if (!process.env.BEDROUTER_CONFIG && !fs.existsSync(file)) file = "./bedrouter.example.json";
   const cfg = JSON.parse(fs.readFileSync(file, "utf8")) as Config;
   if (!Array.isArray(cfg.stack) || !cfg.stack.length) throw new Error(`${file}: missing non-empty "stack"`);
+  // ponytail: `bedrockId` was the field name until 0.9.0, and HABLO-installer writes it from hablo.json. Accepting
+  // both keeps one config portable while the two repositories land the rename. Delete this line in 1.0.0.
+  for (const r of cfg.stack) r.modelId ??= (r as unknown as { bedrockId?: string }).bedrockId!;
   for (const cls of ["trivial", "execute", "explore"] as Class[]) if (!cfg.stack.some((r) => r.enabled && r.serves.includes(cls))) throw new Error(`${file}: no enabled rung serves ${cls}`);
   return cfg;
 }
