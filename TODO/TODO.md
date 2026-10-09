@@ -9,10 +9,10 @@ is not mine to make. Ordered so that each item unblocks the ones under it.
 - [ ] 3. Name the repository in `hablo.json`, and set `enabled: true`
 - [ ] 4. Add `BEDROUTER_PUBLISH_TOKEN` to Infisical
 - [ ] 5. Check the 409 retry against a real repository, once, before the first publish
-- [ ] 6. Publish `bedrouter@0.9.0` to npm
-- [ ] 7. Decide the team `baselineAlias`
+- [x] 6. Publish `bedrouter@0.9.0` to npm
+- [x] 7. Decide the team `baselineAlias`
 - [ ] 8. Decide whether to enable the `codex` rung, and on which machines
-- [ ] 9. Two pre-existing HABLO-installer problems, neither mine
+- [x] 9. Two pre-existing HABLO-installer problems, neither mine
 
 ## 1. Create the stats repository and push it
 
