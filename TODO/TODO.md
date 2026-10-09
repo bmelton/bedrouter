@@ -9,7 +9,7 @@ is not mine to make. Ordered so that each item unblocks the ones under it.
 - [ ] 3. Name the repository in `hablo.json`, and set `enabled: true`
 - [ ] 4. Add `BEDROUTER_PUBLISH_TOKEN` to Infisical
 - [ ] 5. Check the 409 retry against a real repository, once, before the first publish
-- [ ] 6. Publish `bedrouter@0.8.0` to npm
+- [ ] 6. Publish `bedrouter@0.9.0` to npm
 - [ ] 7. Decide the team `baselineAlias`
 - [ ] 8. Decide whether to enable the `codex` rung, and on which machines
 - [ ] 9. Two pre-existing HABLO-installer problems, neither mine
@@ -76,16 +76,16 @@ files exist afterwards and that one call returned 409.
 
 The retry is five attempts with exponential backoff and jitter, in `putDayFile`.
 
-## 6. Publish `bedrouter@0.8.0`
+## 6. Publish `bedrouter@0.9.0`
 
-`package.json` is bumped to 0.8.0. The plan called for 0.7.0 (dashboard) and
-0.8.0 (publish) as two releases; both waves landed in one pass, so one version
-carries them.
+`package.json` is bumped to 0.9.0. The plan called for 0.7.0 (dashboard) and
+0.8.0 (publish) as two releases; both waves landed in one pass. The `modelId`
+rename and the Codex rung came after the 0.8.0 bump, so 0.9.0 carries all of it.
 
 Publication needs `npm login`. HABLO's own plan records `npm whoami` returning
 E401 on this machine as of 2026-09-13, so that is likely still true.
 
-Until 0.8.0 is on npm, `.github/workflows/pages.yml` in the stats repository
+Until 0.9.0 is on npm, `.github/workflows/pages.yml` in the stats repository
 pins a version that does not exist and the page build will fail. The pin is
 deliberate: a page rebuild should be reproducible and an upgrade should be a
 reviewable diff.
