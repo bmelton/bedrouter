@@ -211,6 +211,38 @@ export function stripCachePoints(value: Json): Json {
   return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "cachePoint").map(([key, child]) => [key, stripCachePoints(child)]));
 }
 
+/**
+ * Claude Code sends `anthropic-beta` flags (e.g. prompt-caching-scope-*, redact-thinking-*) that
+ * Bedrock InvokeModel rejects with ValidationException. Collect header + body values, then drop
+ * them from the payload. Return the dropped list for the decision log.
+ */
+export function dropBedrockUnsupportedBetas(payload: Json, headerValue: string | string[] | undefined): string[] {
+  const header = (Array.isArray(headerValue) ? headerValue.join(",") : headerValue ?? "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  const body = Array.isArray(payload.anthropic_beta) ? payload.anthropic_beta.map(String) : [];
+  const dropped = [...new Set([...header, ...body])];
+  if ("anthropic_beta" in payload) delete payload.anthropic_beta;
+  return dropped;
+}
+
+/**
+ * Top-level Messages fields Claude Code sends that Bedrock InvokeModel rejects as
+ * "Extra inputs are not permitted" (e.g. context_management without a matching beta).
+ * Strip them so the turn still completes; HABLO also sets CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS.
+ */
+export const BEDROCK_MESSAGES_DROP_KEYS = ["context_management"] as const;
+
+export function dropBedrockUnsupportedFields(payload: Json): string[] {
+  const dropped: string[] = [];
+  for (const key of BEDROCK_MESSAGES_DROP_KEYS) {
+    if (Object.hasOwn(payload, key)) {
+      delete payload[key];
+      dropped.push(key);
+    }
+  }
+  return dropped;
+}
+
 const capabilityValidation = (err: Json) => err?.name === "ValidationException" && /unsupported|not support|cache|tool|image|schema|stream|max.?token|context/i.test(err?.message ?? "");
 // This account cannot invoke the rung at all: no entitlement, or an id this region does not offer. Bedrock validates
 // ids before IAM, so both verdicts are facts about (account, region, rung) and never about the request.
@@ -323,8 +355,9 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
 
     const { model: _m, stream, ...basePayload } = body;
     basePayload.anthropic_version ??= "bedrock-2023-05-31";
-    const betas = String(req.headers["anthropic-beta"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-    if (betas.length) basePayload.anthropic_beta = [...new Set([...(basePayload.anthropic_beta ?? []), ...betas])];
+    const droppedBetas = dropBedrockUnsupportedBetas(basePayload, req.headers["anthropic-beta"]);
+    if (droppedBetas.length) log.degraded.push(`drop-anthropic-beta:${droppedBetas.join(",")}`);
+    for (const key of dropBedrockUnsupportedFields(basePayload)) log.degraded.push(`drop-${key}`);
 
     const usage: Usage = { input: 0, output: 0 };
     const takeUsage = (u: Json) => {

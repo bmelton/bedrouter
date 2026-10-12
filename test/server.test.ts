@@ -61,6 +61,39 @@ test("messages accepts pinned Anthropic rungs and routes auto within Anthropic o
   assert.equal(refuse.r.status,400);
 })});
 
+test("messages drops Claude Code anthropic-beta flags and context_management Bedrock rejects",async()=>{
+  const {dropBedrockUnsupportedBetas,dropBedrockUnsupportedFields}=await import("../src/server.js");
+  const payload:{anthropic_beta?:string[];context_management?:object;anthropic_version:string}={
+    anthropic_beta:["interleaved-thinking-2025-05-14"],
+    context_management:{edits:[{type:"clear_thinking_20251015",keep:"all"}]},
+    anthropic_version:"bedrock-2023-05-31",
+  };
+  const dropped=dropBedrockUnsupportedBetas(payload,"prompt-caching-scope-2026-01-05, redact-thinking-2026-02-12");
+  assert.deepEqual(dropped.sort(),["interleaved-thinking-2025-05-14","prompt-caching-scope-2026-01-05","redact-thinking-2026-02-12"].sort());
+  assert.equal(payload.anthropic_beta,undefined);
+  assert.deepEqual(dropBedrockUnsupportedFields(payload),["context_management"]);
+  assert.equal(payload.context_management,undefined);
+
+  const sent:any[]=[];
+  await run(cfg,async c=>{sent.push(c.input);return anthropic},async base=>{
+    const r=await fetch(base+"/v1/messages",{method:"POST",headers:{
+      "content-type":"application/json",
+      "anthropic-beta":"prompt-caching-scope-2026-01-05,redact-thinking-2026-02-12",
+    },body:JSON.stringify({
+      model:"deep",messages:[{role:"user",content:"hi"}],max_tokens:10,
+      anthropic_beta:["computer-use-2025-01-24"],
+      context_management:{edits:[{type:"clear_thinking_20251015",keep:"all"}]},
+    })});
+    assert.equal(r.status,200);
+    const body=JSON.parse(Buffer.from(sent[0].body).toString("utf8"));
+    assert.equal(body.anthropic_beta,undefined);
+    assert.equal(body.context_management,undefined);
+    const log=JSON.parse(fs.readFileSync(process.env.BEDROUTER_LOG!,"utf8").trim().split("\n").at(-1)!);
+    assert.ok(log.degraded.some((x:string)=>x.startsWith("drop-anthropic-beta:")),`expected drop note in ${JSON.stringify(log.degraded)}`);
+    assert.ok(log.degraded.includes("drop-context_management"),`expected drop-context_management in ${JSON.stringify(log.degraded)}`);
+  });
+});
+
 test("messages auto reselects another Anthropic rung when the first is unavailable",async()=>{
   const cfg2:Config={stack:[
     {alias:"haiku",modelId:"h",vendor:"anthropic",enabled:true,inputPerM:.5,outputPerM:2,serves:["execute"],capabilities:cap},
