@@ -13,6 +13,7 @@ is not mine to make. Ordered so that each item unblocks the ones under it.
 - [x] 7. Decide the team `baselineAlias`
 - [ ] 8. Decide whether to enable the `codex` rung, and on which machines
 - [x] 9. Two pre-existing HABLO-installer problems, neither mine
+- [ ] 10. Publish `bedrouter@0.10.0` and `pi-bedrouter@0.10.0` to npm (Messages auto / Phase 0a; HABLO already pins `pi-bedrouter@0.10.0`)
 
 ## 1. Create the stats repository and push it
 
