@@ -190,7 +190,7 @@ than the pinned rung. The one exception is a `trivial` class with
 
 ## Client API
 
-Use the OpenAI-compatible endpoint for `auto` and all cross-vendor routing:
+Use the OpenAI-compatible endpoint for cross-vendor `auto` (Pi and other OpenAI clients):
 
 ```sh
 curl http://127.0.0.1:20129/v1/chat/completions \
@@ -198,8 +198,17 @@ curl http://127.0.0.1:20129/v1/chat/completions \
   -d '{"model":"auto","messages":[{"role":"user","content":"Summarize this."}]}'
 ```
 
-`POST /v1/messages` accepts pinned Anthropic aliases only. It rejects `auto`
-because native Anthropic request bodies cannot be routed safely to every vendor.
+`POST /v1/messages` is the Anthropic Messages shape (Claude Code). It accepts
+pinned Anthropic aliases and `auto`. With `auto`, the router classifies and
+escalates among **enabled Anthropic rungs only** (Phase 0a). Cross-vendor
+Messages routing is deferred; non-Anthropic pins still return 400 and should
+use `/v1/chat/completions`.
+
+```sh
+curl http://127.0.0.1:20129/v1/messages \
+  -H 'content-type: application/json' \
+  -d '{"model":"auto","max_tokens":64,"messages":[{"role":"user","content":"Summarize this."}]}'
+```
 
 Other endpoints:
 

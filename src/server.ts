@@ -95,7 +95,7 @@ export const sessionKeyOf = (h: string | string[] | undefined): string | null =>
 };
 
 // Per-request routing state shared between the handler and the finally block.
-type RouteCtx = { decision?: Decision; requested?: Rung; body?: Json; tools: ToolJsonCheck };
+type RouteCtx = { decision?: Decision; requested?: Rung; body?: Json; tools: ToolJsonCheck; /** Aliases excluded from selection for this request (e.g. non-Anthropic on /v1/messages). */ excludeAliases?: Set<string> };
 
 function appendLog(entry: LogEntry) {
   // sync on purpose: one small line per request, and the line must survive a process exit right after the response
@@ -272,19 +272,21 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     return rung;
   };
 
-  /** Resolve the client's model, let the rules pick the rung within that family, and consult the classifier model when they were undecided. */
-  const route = async (req: http.IncomingMessage, body: Json, log: LogEntry, rt: RouteCtx, forcedHeader?: string): Promise<Rung> => {
+  /** Resolve the client's model, let the rules pick the rung, and consult the classifier when they were undecided. */
+  const route = async (req: http.IncomingMessage, body: Json, log: LogEntry, rt: RouteCtx, forcedHeader?: string, excludeAliases?: Set<string>): Promise<Rung> => {
     const requested = resolve(body.model);
     const header = forcedHeader ?? req.headers["x-bedrouter-class"];
     if (header !== undefined && !/^(trivial|execute|explore|off)$/.test(String(header))) throw new HttpError(400, `x-bedrouter-class must be trivial, execute, explore or off`);
     rt.requested = requested;
-    let d = (rt.decision = router.route(body, requested, header as string | undefined));
+    if (excludeAliases) rt.excludeAliases = excludeAliases;
+    const excluded = rt.excludeAliases ?? new Set<string>();
+    let d = (rt.decision = router.route(body, requested, header as string | undefined, excluded));
     if (d.undecided && classifierRung) {
       const v = await classifyWithModel(client, classifierRung, body, router.rc.classifier);
       log.classifierNote = v.note;
       log.classifierMs = v.ms;
       log.classifierCostUsd = v.costUsd;
-      if (v.class) d = rt.decision = router.reclassify(d, requested, v.class, `classifier:${v.class}`, body);
+      if (v.class) d = rt.decision = router.reclassify(d, requested, v.class, `classifier:${v.class}`, body, excluded);
       // on error/unparseable the rules' decision stands; the note in the log says why
     }
     Object.assign(log, {
@@ -302,19 +304,28 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
     return d.rung;
   };
 
+  /** Non-Anthropic aliases: /v1/messages stays on the native Anthropic InvokeModel path (Phase 0a). */
+  const nonAnthropicAliases = () => new Set(router.ranked.filter((r) => r.vendor !== "anthropic").map((r) => r.alias));
+
   // --- POST /v1/messages: Anthropic Messages shape, native passthrough via InvokeModel -------------
   async function handleMessages(req: http.IncomingMessage, res: http.ServerResponse, body: Json, log: LogEntry, ac: AbortController, rt: RouteCtx) {
-    const rung = await route(req, body, log, rt, "off");
-    if (rt.requested?.auto || rung.vendor !== "anthropic") {
-      // ponytail: Anthropic-shape -> non-Anthropic model needs an Anthropic->Converse translator; add one when a
-      // Claude Code user actually wants gpt-oss. Until then this is a clear 400, never a silent re-route.
-      throw new HttpError(400, `model "${body.model}" can route across vendors; use /v1/chat/completions (only pinned Anthropic rungs use /v1/messages)`);
+    const requested = resolve(body.model);
+    // auto: classify + escalate within Anthropic rungs only. Pinned: honor the alias (header:off), Anthropic-only.
+    const rung0 = requested.auto
+      ? await route(req, body, log, rt, undefined, nonAnthropicAliases())
+      : await route(req, body, log, rt, "off");
+    if (rung0.vendor !== "anthropic") {
+      // ponytail: Anthropic-shape -> non-Anthropic needs a Messages↔Converse translator (Phase 0b). Clear 400 until then.
+      throw new HttpError(400, requested.auto
+        ? `auto on /v1/messages needs an enabled Anthropic rung that serves this request; use /v1/chat/completions for cross-vendor routing`
+        : `model "${body.model}" is not Anthropic; use /v1/chat/completions for cross-vendor routing`);
     }
-    const { model: _m, stream, ...payload } = body;
-    payload.anthropic_version ??= "bedrock-2023-05-31";
+
+    const { model: _m, stream, ...basePayload } = body;
+    basePayload.anthropic_version ??= "bedrock-2023-05-31";
     const betas = String(req.headers["anthropic-beta"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-    if (betas.length) payload.anthropic_beta = [...new Set([...(payload.anthropic_beta ?? []), ...betas])];
-    const cmd = { modelId: rung.modelId, contentType: "application/json", accept: "application/json", body: JSON.stringify(payload) };
+    if (betas.length) basePayload.anthropic_beta = [...new Set([...(basePayload.anthropic_beta ?? []), ...betas])];
+
     const usage: Usage = { input: 0, output: 0 };
     const takeUsage = (u: Json) => {
       if (!u) return;
@@ -324,8 +335,31 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       if (u.cache_creation_input_tokens != null) usage.cacheWrite = u.cache_creation_input_tokens;
     };
 
+    /** Send, and when the chosen Anthropic rung itself is the problem, drop it and reselect within Anthropic. */
+    const sendRouted = async <T>(send: (rung: Rung, payload: Json) => Promise<T>): Promise<{ out: T; rung: Rung }> => {
+      let rung = rung0;
+      for (let tries = 0; ; tries++) {
+        const payload = { ...basePayload };
+        try { return { out: await send(rung, payload), rung }; }
+        catch (err) {
+          const fatal = unavailableModel(err) ? "unavailable" : capabilityValidation(err) ? "validation-contradiction" : null;
+          if (!fatal || !rt.decision || tries >= MAX_REROUTES) throw err;
+          const rejected = rung.alias;
+          if (fatal === "unavailable") router.markUnavailable(rejected, Infinity);
+          else if (!router.invalidate(rt.decision, body)) throw err;
+          try { rung = await route(req, body, log, rt, requested.auto ? undefined : "off", rt.excludeAliases); }
+          catch { throw err; }
+          if (rung.vendor !== "anthropic") throw err;
+          if (fatal !== "unavailable") log.skipped.push(`${rejected}:${fatal}`);
+        }
+      }
+    };
+
     if (!stream) {
-      const out = await client.send(new InvokeModelCommand(cmd), { abortSignal: ac.signal });
+      const { out, rung } = await sendRouted(async (rung, payload) => {
+        const cmd = { modelId: rung.modelId, contentType: "application/json", accept: "application/json", body: JSON.stringify(payload) };
+        return client.send(new InvokeModelCommand(cmd), { abortSignal: ac.signal });
+      });
       const msg = JSON.parse(Buffer.from(out.body).toString("utf8"));
       takeUsage(msg.usage);
       log.stopReason = msg.stop_reason ?? null;
@@ -334,7 +368,10 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       return sendJson(res, 200, msg);
     }
 
-    const out = await client.send(new InvokeModelWithResponseStreamCommand(cmd), { abortSignal: ac.signal });
+    const { out, rung } = await sendRouted(async (rung, payload) => {
+      const cmd = { modelId: rung.modelId, contentType: "application/json", accept: "application/json", body: JSON.stringify(payload) };
+      return client.send(new InvokeModelWithResponseStreamCommand(cmd), { abortSignal: ac.signal });
+    });
     startSse(res, decisionHeaders(log));
     for await (const ev of out.body ?? []) {
       if (!ev.chunk?.bytes) {
@@ -531,7 +568,7 @@ export function createServer(cfg: Config = loadConfig(), client: Pick<BedrockRun
       log.latencyMs = Date.now() - started;
       if (rt.decision) {
         const d = rt.decision;
-        const obs = router.observe(d, { stopReason: log.stopReason, outputTokens: log.outputTokens, errorStatus: failed ? errorStatus(failed) : null, aborted: ac.signal.aborted, malformedToolJson: rt.tools.malformed() }, rt.body);
+        const obs = router.observe(d, { stopReason: log.stopReason, outputTokens: log.outputTokens, errorStatus: failed ? errorStatus(failed) : null, aborted: ac.signal.aborted, malformedToolJson: rt.tools.malformed() }, rt.body, rt.excludeAliases ?? new Set());
         log.escalated = d.escalated || obs.escalated;
         log.escalationReason = [d.escalationReason, obs.reason].filter(Boolean).join("+") || null;
       }

@@ -47,6 +47,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     console.log(`/v1/messages        [${anthropicModel}] status=${m.status} text=${JSON.stringify(mText)}${mErr ? " error=" + mErr.message : ""}`);
     failed ||= m.status !== 200 || !!mErr;
 
+    const ma = await sse(`${base}/v1/messages`, { model: "auto", max_tokens: 20, stream: true, messages: [{ role: "user", content: "Say hi in one word." }] });
+    const maText = ma.lines.map((l) => { try { const e = JSON.parse(l); return e.delta?.text ?? ""; } catch { return ""; } }).join("");
+    const maErr = errorIn(ma);
+    console.log(`/v1/messages        [auto] status=${ma.status} text=${JSON.stringify(maText)}${maErr ? " error=" + maErr.message : ""}`);
+    failed ||= !anthropicModel || ma.status !== 200 || !!maErr;
+
     // gpt-oss reasons before it answers and the reasoning counts against max_tokens, so give it room and show both parts.
     const c = await sse(`${base}/v1/chat/completions`, { model: openaiModel, max_tokens: 300, stream: true, messages: [{ role: "user", content: "Say hi in one word." }] });
     const deltas = c.lines.filter((l) => l !== "[DONE]").map((l) => { try { return JSON.parse(l).choices?.[0]?.delta ?? {}; } catch { return {}; } });

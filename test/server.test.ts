@@ -44,7 +44,41 @@ const anthropic={body:Buffer.from(JSON.stringify({content:[{type:"text",text:"hi
 async function run(config:Config,send:(cmd:any)=>Promise<any>,fn:(base:string)=>Promise<void>){const server=createServer(config,{send});await new Promise<void>(r=>server.listen(0,"127.0.0.1",r));const base=`http://127.0.0.1:${(server.address() as AddressInfo).port}`;try{await fn(base)}finally{server.close()}}
 const post=async(base:string,path:string,body:any)=>{const r=await fetch(base+path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});return{r,json:await r.json()}};
 
-test("messages remains a native path for pinned Anthropic rungs and refuses auto",async()=>{const sent:any[]=[];await run(cfg,async c=>{sent.push(c.input);return anthropic},async base=>{assert.equal((await post(base,"/v1/messages",{model:"deep",messages:[{role:"user",content:"hi"}],max_tokens:10})).r.status,200);assert.equal(sent[0].modelId,"d");assert.equal((await post(base,"/v1/messages",{model:"auto",messages:[{role:"user",content:"hi"}],max_tokens:10})).r.status,400)})});
+test("messages accepts pinned Anthropic rungs and routes auto within Anthropic only",async()=>{const sent:any[]=[];await run(cfg,async c=>{sent.push(c.input);return anthropic},async base=>{
+  const pinned=await post(base,"/v1/messages",{model:"deep",messages:[{role:"user",content:"hi"}],max_tokens:10});
+  assert.equal(pinned.r.status,200);
+  assert.equal(sent[0].modelId,"d");
+  assert.equal(pinned.r.headers.get("x-bedrouter-model"),"deep");
+  sent.length=0;
+  const auto=await post(base,"/v1/messages",{model:"auto",messages:[{role:"user",content:"implement it"}],max_tokens:10});
+  assert.equal(auto.r.status,200,JSON.stringify(auto.json));
+  // Cheapest execute is openai/work, but /v1/messages must stay on Anthropic (deep).
+  assert.equal(sent[0].modelId,"d");
+  assert.equal(auto.r.headers.get("x-bedrouter-model"),"deep");
+  assert.equal(auto.r.headers.get("x-bedrouter-requested"),"auto");
+  assert.equal(auto.r.headers.get("x-bedrouter-class"),"execute");
+  const refuse=await post(base,"/v1/messages",{model:"work",messages:[{role:"user",content:"hi"}],max_tokens:10});
+  assert.equal(refuse.r.status,400);
+})});
+
+test("messages auto reselects another Anthropic rung when the first is unavailable",async()=>{
+  const cfg2:Config={stack:[
+    {alias:"haiku",modelId:"h",vendor:"anthropic",enabled:true,inputPerM:.5,outputPerM:2,serves:["execute"],capabilities:cap},
+    {alias:"sonnet",modelId:"s",vendor:"anthropic",enabled:true,inputPerM:2,outputPerM:10,serves:["execute","explore"],capabilities:{...cap,promptCaching:true}},
+    {alias:"work",modelId:"w",vendor:"openai",enabled:true,inputPerM:.2,outputPerM:.4,serves:["execute"],capabilities:cap},
+  ],routing:{enabled:true,keywords:{explore:["design"],execute:["implement"]},classifier:{enabled:false}}};
+  const ids:string[]=[];
+  await run(cfg2,async c=>{
+    ids.push(c.input.modelId);
+    if(c.input.modelId==="h")throw Object.assign(new Error("not available for this account"),{name:"AccessDeniedException",$metadata:{httpStatusCode:403}});
+    return anthropic;
+  },async base=>{
+    const out=await post(base,"/v1/messages",{model:"auto",messages:[{role:"user",content:"implement it"}],max_tokens:10});
+    assert.equal(out.r.status,200,JSON.stringify(out.json));
+    assert.deepEqual(ids,["h","s"]);
+    assert.equal(out.r.headers.get("x-bedrouter-model"),"sonnet");
+  });
+});
 
 test("auto uses chat/Converse, exposes stack metadata, and strips cache points only when needed",async()=>{const sent:any[]=[];await run(cfg,async c=>{sent.push(c.input);return reply},async base=>{const body={model:"auto",messages:[{role:"user",content:"implement it"},{cachePoint:{type:"default"}}]};const out=await post(base,"/v1/chat/completions",body);assert.equal(out.r.status,200);assert.equal(sent[0].modelId,"w");assert.doesNotMatch(JSON.stringify(sent[0]),/cachePoint/);const models=await(await fetch(base+"/v1/models")).json();const auto=models.data.find((m:any)=>m.id==="auto");assert.equal(auto.bedrouter.vendor,"openai");assert.deepEqual(auto.bedrouter.serves,["execute"]);assert.equal(auto.bedrouter.capabilities.maxOutput,64000)})});
 
